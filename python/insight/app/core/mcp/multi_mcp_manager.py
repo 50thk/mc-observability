@@ -6,6 +6,7 @@ from app.core.mcp.grafana_mcp_context import GrafanaMCPContext
 from app.core.mcp.influxdb_mcp_context import InfluxDBMCPContext
 from app.core.mcp.mariadb_mcp_context import MariaDBMCPContext
 from app.core.mcp.mcp_context import MCPContext
+from app.core.mcp.tempo_mcp_context import TempoMCPContext
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +33,12 @@ class MCPManager:
     def add_grafana_mcp(self, name: str, mcp_url: str):
         """Add Grafana MCP client."""
         client = GrafanaMCPContext(mcp_url)
+        self.mcp_clients[name] = client
+        return client
+
+    def add_tempo_mcp(self, name: str, mcp_url: str):
+        """Add Tempo MCP client."""
+        client = TempoMCPContext(mcp_url)
         self.mcp_clients[name] = client
         return client
 

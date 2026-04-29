@@ -129,6 +129,7 @@ llm:
     mcp_grafana_url: http://mc-observability-mcp-grafana:8000/sse
     mcp_mariadb_url: http://mc-observability-mcp-mariadb:8001/sse
     mcp_influxdb_url: http://mc-observability-mcp-influx:8002/sse
+    mcp_tempo_url: http://mc-observability-tempo:3200/api/mcp
   chat_summarization:
     max_tokens_before_summary: 5000
     summary_prompt: |

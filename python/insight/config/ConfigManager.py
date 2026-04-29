@@ -84,6 +84,7 @@ class ConfigManager:
             "mcp_grafana_url": mcp.get("mcp_grafana_url", ""),
             "mcp_mariadb_url": mcp.get("mcp_mariadb_url", ""),
             "mcp_influxdb_url": mcp.get("mcp_influxdb_url", ""),
+            "mcp_tempo_url": mcp.get("mcp_tempo_url", ""),
         }
 
     def get_log_system_prompt_config(self):
