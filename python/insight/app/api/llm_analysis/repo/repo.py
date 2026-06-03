@@ -91,11 +91,15 @@ class ServerErrorAnalysisRepository:
         self.db.refresh(record)
         return record, True
 
-    def mark_running(self, analysis_id: int) -> bool:
+    def mark_running(self, analysis_id: int, allow_succeeded: bool = False) -> bool:
+        allowed_statuses = ["PENDING", "FAILED"]
+        if allow_succeeded:
+            allowed_statuses.append("SUCCEEDED")
+
         updated = (
             self.db.query(ServerErrorAnalysis)
             .filter(ServerErrorAnalysis.ID == analysis_id)
-            .filter(ServerErrorAnalysis.STATUS.in_(["PENDING", "FAILED"]))
+            .filter(ServerErrorAnalysis.STATUS.in_(allowed_statuses))
             .update(
                 {
                     ServerErrorAnalysis.STATUS: "RUNNING",
