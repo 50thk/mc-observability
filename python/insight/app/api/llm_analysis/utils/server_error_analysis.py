@@ -77,11 +77,15 @@ class ServerErrorAnalysisService:
         start = body.time_range_start or end - timedelta(minutes=analysis_config["detection_lookback_minutes"])
         session = self._get_or_create_session(None, body.provider, body.model_name)
         candidates = await self._query_5xx_candidates(start, end, body.limit)
+        if not candidates:
+            return ServerErrorDetectResult(accepted=True, analysis_ids=[])
+
+        agent = await self._create_agent(session.PROVIDER, session.MODEL_NAME)
+        graph = create_server_error_analysis_graph(self.analysis_repo, agent, self.config)
         analysis_ids = []
+        seen_analysis_ids = set()
 
         for candidate in candidates:
-            agent = await self._create_agent(session.PROVIDER, session.MODEL_NAME)
-            graph = create_server_error_analysis_graph(self.analysis_repo, agent, self.config)
             result = await graph.ainvoke(
                 {
                     "mode": "auto",
@@ -95,8 +99,10 @@ class ServerErrorAnalysisService:
                 },
                 config={"configurable": {"thread_id": session.SESSION_ID}},
             )
-            if result.get("analysis_id"):
-                analysis_ids.append(result["analysis_id"])
+            analysis_id = result.get("analysis_id")
+            if analysis_id and analysis_id not in seen_analysis_ids:
+                seen_analysis_ids.add(analysis_id)
+                analysis_ids.append(analysis_id)
 
         return ServerErrorDetectResult(accepted=True, analysis_ids=analysis_ids)
 
@@ -218,7 +224,7 @@ class ServerErrorAnalysisService:
 
     def _extract_candidates(self, result, limit):
         if isinstance(result, dict) and isinstance(result.get("candidates"), list):
-            return result["candidates"][:limit]
+            return [self._sanitize_candidate(candidate) for candidate in result["candidates"][:limit]]
         if isinstance(result, dict):
             streams = None
             if isinstance(result.get("data"), dict):
@@ -228,7 +234,7 @@ class ServerErrorAnalysisService:
             if isinstance(streams, list):
                 return self._extract_loki_stream_candidates(streams, limit)
         if isinstance(result, list):
-            return result[:limit]
+            return [self._sanitize_candidate(candidate) for candidate in result[:limit]]
         return [
             {
                 "trace_id": None,
@@ -259,6 +265,45 @@ class ServerErrorAnalysisService:
                 if len(candidates) >= limit:
                     return candidates
         return candidates
+
+    def _sanitize_candidate(self, candidate):
+        if not isinstance(candidate, dict):
+            return {
+                "trace_id": None,
+                "dedup_basis": "trace_id",
+                "no_trace_context": {"raw_result_type": type(candidate).__name__},
+            }
+
+        max_log_line_chars = self.config.get_server_error_analysis_config().get("max_log_line_chars", 4000)
+        evidence = candidate.get("evidence") if isinstance(candidate.get("evidence"), dict) else {}
+        log_summary = (
+            evidence.get("log_summary")
+            or candidate.get("log_summary")
+            or candidate.get("message")
+            or candidate.get("line")
+        )
+
+        sanitized = {
+            "trace_id": candidate.get("trace_id") or candidate.get("traceID"),
+            "service_name": candidate.get("service_name") or candidate.get("service") or candidate.get("app"),
+            "status_code": candidate.get("status_code") or candidate.get("status"),
+            "dedup_basis": "trace_id",
+        }
+
+        if log_summary is not None:
+            log_summary = str(log_summary)
+            sanitized["evidence"] = {
+                "log_summary": log_summary[:max_log_line_chars],
+                "truncated": bool(evidence.get("truncated")) or len(log_summary) > max_log_line_chars,
+            }
+
+        if sanitized["trace_id"] is None:
+            no_trace_context = candidate.get("no_trace_context")
+            sanitized["no_trace_context"] = (
+                no_trace_context if isinstance(no_trace_context, dict) else {"raw_result_type": "dict"}
+            )
+
+        return {key: value for key, value in sanitized.items() if value is not None}
 
     @staticmethod
     def _provider_value(provider) -> str:
