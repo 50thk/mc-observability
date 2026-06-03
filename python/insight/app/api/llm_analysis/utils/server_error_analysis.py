@@ -219,6 +219,14 @@ class ServerErrorAnalysisService:
     def _extract_candidates(self, result, limit):
         if isinstance(result, dict) and isinstance(result.get("candidates"), list):
             return result["candidates"][:limit]
+        if isinstance(result, dict):
+            streams = None
+            if isinstance(result.get("data"), dict):
+                streams = result["data"].get("result")
+            elif isinstance(result.get("result"), list):
+                streams = result["result"]
+            if isinstance(streams, list):
+                return self._extract_loki_stream_candidates(streams, limit)
         if isinstance(result, list):
             return result[:limit]
         return [
@@ -228,6 +236,29 @@ class ServerErrorAnalysisService:
                 "no_trace_context": {"raw_result_type": type(result).__name__},
             }
         ]
+
+    def _extract_loki_stream_candidates(self, streams, limit):
+        max_log_line_chars = self.config.get_server_error_analysis_config().get("max_log_line_chars", 4000)
+        candidates = []
+        for stream in streams:
+            labels = stream.get("stream", {})
+            for _, line in stream.get("values", []):
+                line_text = str(line)
+                candidates.append(
+                    {
+                        "trace_id": labels.get("trace_id") or labels.get("traceID"),
+                        "service_name": labels.get("service_name") or labels.get("app"),
+                        "status_code": labels.get("status") or labels.get("status_code"),
+                        "dedup_basis": "trace_id",
+                        "evidence": {
+                            "log_summary": line_text[:max_log_line_chars],
+                            "truncated": len(line_text) > max_log_line_chars,
+                        },
+                    }
+                )
+                if len(candidates) >= limit:
+                    return candidates
+        return candidates
 
     @staticmethod
     def _provider_value(provider) -> str:
