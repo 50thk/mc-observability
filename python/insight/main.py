@@ -10,6 +10,7 @@ from app.api.llm_analysis import (
     api_key_router,
     log_analysis_router,
     model_router,
+    server_error_analysis_router,
     session_router,
 )
 from app.api.prediction import prediction
@@ -43,6 +44,7 @@ app.include_router(api_key_router, prefix=api_prefix, tags=["[Insight] LLM API K
 app.include_router(model_router, prefix=api_prefix, tags=["[Insight] LLM Model Options"])
 app.include_router(log_analysis_router, prefix=api_prefix, tags=["[Insight] Log Analysis"])
 app.include_router(alert_analysis_router, prefix=api_prefix, tags=["[Insight] Alert Analysis"])
+app.include_router(server_error_analysis_router, prefix=api_prefix, tags=["[Insight] Server Error Analysis"])
 app.include_router(readyz.router, tags=["[Insight] System Management"])
 
 if __name__ == "__main__":
