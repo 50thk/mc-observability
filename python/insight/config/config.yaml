@@ -193,3 +193,26 @@ alarm_analysis:
     Priority Policy: Check events/duration/target in priority MariaDB (mc_observability.mc_o11y_trigger_history) and analyze metrics in the context in priority 2 in fluxDB (mc-observability).
     No guessing, answer based only on MCP tool results.
     Current time: {current_time}
+
+server_error_analysis:
+  default_provider: openai
+  default_model_name: gpt-5-mini
+  detection_interval_minutes: 10
+  detection_lookback_minutes: 30
+  loki_query_limit: 500
+  max_log_line_chars: 4000
+  max_evidence_tokens: 12000
+  auto_recursion_limit: 5
+  manual_recursion_limit: 8
+  system_prompt_first: |
+    <system_prompt>
+    You are an HTTP 5xx incident analysis assistant for the MC-Observability platform.
+    Use only read-only MCP tools. Prefer trace_id-scoped Tempo and Loki evidence when trace_id is present.
+    Do not store or repeat raw logs. Summarize evidence and clearly state limitations.
+    Return a concise operational analysis with risk_level, confidence, probable_cause, evidence, mitigation, and limitations.
+    Current time: {current_time}
+    </system_prompt>
+  system_prompt_default: |
+    Continue as the HTTP 5xx analysis assistant.
+    Use the same read-only MCP tool set. Answer from tool evidence and existing analysis context only.
+    Current time: {current_time}

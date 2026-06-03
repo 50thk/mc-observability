@@ -41,3 +41,25 @@ async def get_alert_analysis_context():
     finally:
         logger.info("Disconnecting MariaDB and InfluxDB MCPs for alert analysis...")
         await manager.stop_all()
+
+
+async def get_server_error_analysis_context():
+    """
+    Dependency to get a MCPManager for HTTP 5xx analysis.
+    It connects the same read-only MCP tool set for auto and manual analysis.
+    """
+    config_manager = ConfigManager()
+    mcp_config = config_manager.get_mcp_config()
+    manager = MCPManager()
+    manager.add_grafana_mcp("grafana", mcp_config["mcp_grafana_url"])
+    manager.add_tempo_mcp("tempo", mcp_config["mcp_tempo_url"])
+    manager.add_mariadb_mcp("mariadb", mcp_config["mcp_mariadb_url"])
+    manager.add_influxdb_mcp("influxdb", mcp_config["mcp_influxdb_url"])
+
+    try:
+        logger.info("Connecting MCPs for server error analysis...")
+        await manager.start_all()
+        yield manager
+    finally:
+        logger.info("Disconnecting MCPs for server error analysis...")
+        await manager.stop_all()

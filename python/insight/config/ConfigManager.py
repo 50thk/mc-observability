@@ -112,6 +112,27 @@ class ConfigManager:
             "system_prompt_default": alarm_analysis.get("system_prompt_default", ""),
         }
 
+    def get_server_error_analysis_config(self):
+        server_error = self.config.get("server_error_analysis", {})
+        return {
+            "default_provider": server_error.get("default_provider", "openai"),
+            "default_model_name": server_error.get("default_model_name", "gpt-5-mini"),
+            "detection_interval_minutes": server_error.get("detection_interval_minutes", 10),
+            "detection_lookback_minutes": server_error.get("detection_lookback_minutes", 30),
+            "loki_query_limit": server_error.get("loki_query_limit", 500),
+            "max_log_line_chars": server_error.get("max_log_line_chars", 4000),
+            "max_evidence_tokens": server_error.get("max_evidence_tokens", 12000),
+            "auto_recursion_limit": server_error.get("auto_recursion_limit", 5),
+            "manual_recursion_limit": server_error.get("manual_recursion_limit", 8),
+        }
+
+    def get_server_error_system_prompt_config(self):
+        server_error = self.config.get("server_error_analysis", {})
+        return {
+            "system_prompt_first": server_error.get("system_prompt_first", ""),
+            "system_prompt_default": server_error.get("system_prompt_default", ""),
+        }
+
     def get_chat_summarization_config(self):
         chat_summarization = self.config.get("llm", {}).get("chat_summarization", {})
         return {
