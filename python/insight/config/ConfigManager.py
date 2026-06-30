@@ -115,22 +115,11 @@ class ConfigManager:
     def get_server_error_analysis_config(self):
         server_error = self.config.get("server_error_analysis", {})
         return {
-            "default_provider": server_error.get("default_provider", "openai"),
-            "default_model_name": server_error.get("default_model_name", "gpt-5-mini"),
-            "detection_lookback_minutes": server_error.get("detection_lookback_minutes", 30),
-            "supervisor_recursion_limit": server_error.get("supervisor_recursion_limit", 30),
-            "supervisor_model_call_limit": server_error.get("supervisor_model_call_limit", 10),
-            "supervisor_tool_call_limit": server_error.get("supervisor_tool_call_limit", 12),
-            "subagent_model_call_limit": server_error.get("subagent_model_call_limit", 8),
-            "subagent_tool_call_limit": server_error.get("subagent_tool_call_limit", 10),
-            "subagent_tool_retry_max_retries": server_error.get("subagent_tool_retry_max_retries", 2),
-        }
-
-    def get_server_error_system_prompt_config(self):
-        server_error = self.config.get("server_error_analysis", {})
-        return {
-            "system_prompt_first": server_error.get("system_prompt_first", ""),
-            "system_prompt_default": server_error.get("system_prompt_default", ""),
+            "collector_timeout_seconds": server_error.get("collector_timeout_seconds", 90),
+            "max_tool_result_preview_chars": server_error.get("max_tool_result_preview_chars", 8000),
+            "max_evidence_per_source": server_error.get("max_evidence_per_source", 20),
+            "metric_database": server_error.get("metric_database", "mc-observerbility"),
+            "observability_schema": server_error.get("observability_schema", {}),
         }
 
     def get_chat_summarization_config(self):

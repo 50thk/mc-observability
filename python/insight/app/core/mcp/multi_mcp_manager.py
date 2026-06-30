@@ -107,22 +107,7 @@ class MCPManager:
 
     def get_tools_for_mcp(self, name: str):
         """Return LangChain tools loaded from a specific MCP client."""
-        if name in self.tools_by_mcp:
-            return self.tools_by_mcp[name]
-
-        client = self.get_client(name)
-        if not client or not getattr(client, "tools", None):
-            return []
-
-        tool_names = {
-            tool.name
-            for tool in getattr(client.tools, "tools", [])
-        }
-        return [
-            tool
-            for tool in self.get_all_tools() or []
-            if getattr(tool, "name", None) in tool_names
-        ]
+        return self.tools_by_mcp.get(name, [])
 
     def get_client(self, name: str):
         """Return client with specific name."""

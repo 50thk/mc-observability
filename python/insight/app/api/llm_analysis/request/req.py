@@ -76,21 +76,44 @@ class DeleteAPIKeyFilter(BaseModel):
     provider: APIProviderType = Field(Query(description="The LLM provider to use", example="openai"))
 
 
-class PostServerErrorDetectBody(BaseModel):
-    provider: ProviderType = Field(default=ProviderType.openai, description="LLM provider for automatic analysis")
-    model_name: str = Field(default="gpt-5-mini", description="LLM model for automatic analysis")
-    time_range_start: datetime | None = Field(default=None, description="Detection window start")
-    time_range_end: datetime | None = Field(default=None, description="Detection window end")
-    limit: int = Field(default=20, ge=1, le=100, description="Maximum number of 5xx candidates to analyze")
+class ServerErrorQueryTimeRange(BaseModel):
+    start: datetime | None = Field(default=None)
+    end: datetime | None = Field(default=None)
+    timezone: str | None = Field(default=None)
+
+
+class ServerErrorQueryFilters(BaseModel):
+    trace_id: str | None = Field(default=None)
+    service_name: str | None = Field(default=None)
+    node_id: str | None = Field(default=None)
+    infra_id: str | None = Field(default=None)
+    level: str | None = Field(default=None)
+    message: str | None = Field(default=None)
+
+
+class ServerErrorQueryOptions(BaseModel):
+    max_evidence_per_source: int = Field(default=20, ge=1, le=100)
 
 
 class PostServerErrorQueryBody(BaseModel):
     session_id: str | None = Field(default=None, description="Existing chat session ID")
-    analysis_id: int | None = Field(default=None, description="Existing server error analysis ID")
     trace_id: str | None = Field(default=None, description="Trace ID to analyze")
-    message: str = Field(..., min_length=1, description="User analysis request")
+    query: str | None = Field(default=None, min_length=1, description="Observability RCA query")
+    time_range: ServerErrorQueryTimeRange | None = Field(default=None)
+    filters: ServerErrorQueryFilters = Field(default_factory=ServerErrorQueryFilters)
+    options: ServerErrorQueryOptions = Field(default_factory=ServerErrorQueryOptions)
     provider: ProviderType | None = Field(default=None, description="LLM provider when a new session is needed")
     model_name: str | None = Field(default=None, description="LLM model when a new session is needed")
+
+    @model_validator(mode="after")
+    def validate_query(self):
+        if not self.query:
+            raise ValueError("query is required")
+        if self.trace_id and not self.filters.trace_id:
+            self.filters.trace_id = self.trace_id
+        if self.filters.trace_id and not self.trace_id:
+            self.trace_id = self.filters.trace_id
+        return self
 
 
 class ServerErrorRecordFilter(BaseModel):

@@ -1,9 +1,11 @@
-from contextlib import asynccontextmanager
 import logging
+import os
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.api.anomaly import anomaly
 from app.api.llm_analysis import (
@@ -16,7 +18,7 @@ from app.api.llm_analysis import (
 )
 from app.api.prediction import prediction
 from app.api.readyz import readyz
-from app.core.graph.server_error_analysis_graph import ServerErrorGraphRuntime
+from app.core.graph.server_error_analysis_graph import build_server_error_analysis_graph
 from app.core.otel.log import init_otel_logger
 from app.core.otel.trace import init_otel_trace
 from config.ConfigManager import ConfigManager
@@ -29,11 +31,10 @@ config = ConfigManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.server_error_graph_runtime = await ServerErrorGraphRuntime.create()
-    try:
+    os.makedirs("checkpoints", exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string("checkpoints/checkpoints.sqlite") as checkpointer:
+        app.state.server_error_graph = build_server_error_analysis_graph(checkpointer)
         yield
-    finally:
-        await app.state.server_error_graph_runtime.aclose()
 
 
 app = FastAPI(title="Insight Module DOCS", description="mc-observability insight module", lifespan=lifespan)

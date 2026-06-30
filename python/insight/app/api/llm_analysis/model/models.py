@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, Column, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Column, DateTime, Integer, String, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
@@ -26,9 +26,8 @@ class LLMAPIKey(Base):
 
 class ServerErrorAnalysis(Base):
     __tablename__ = "mc_o11y_insight_server_error_analysis"
-    __table_args__ = (UniqueConstraint("TRACE_ID", name="uk_server_error_trace_id"),)
 
-    ID = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    ID = Column(Integer, primary_key=True, autoincrement=True)
     TRACE_ID = Column(String(64), nullable=True)
     SESSION_ID = Column(String(100), nullable=False)
     STATUS = Column(String(20), nullable=False, default="PENDING")

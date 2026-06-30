@@ -44,7 +44,7 @@ async def get_alert_analysis_context():
 
 async def get_server_error_analysis_context():
     """
-    Dependency to get a MCPManager for HTTP 5xx analysis.
+    Dependency to get a MCPManager for observability RCA analysis.
     It connects the same read-only MCP tool set for auto and manual analysis.
     """
     config_manager = ConfigManager()

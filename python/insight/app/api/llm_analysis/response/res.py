@@ -98,15 +98,6 @@ class ServerErrorAnalysisRecord(BaseModel):
     updated_at: datetime
 
 
-class ServerErrorDetectResult(BaseModel):
-    accepted: bool
-    analysis_ids: list[int]
-
-
-class ResBodyServerErrorDetect(BaseResponse):
-    data: ServerErrorDetectResult
-
-
 class ResBodyServerErrorRecord(BaseResponse):
     data: ServerErrorAnalysisRecord
 
