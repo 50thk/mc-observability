@@ -1,3 +1,5 @@
+import logging
+
 import yaml
 
 
@@ -79,27 +81,21 @@ class ConfigManager:
         return model
 
     def get_mcp_config(self):
+        """Return the declarative MCP server map: {name: {url, transport, enabled?, ...}}."""
         mcp = self.config.get("llm", {}).get("mcp", {})
-        return {
-            "mcp_grafana_url": mcp.get("mcp_grafana_url", ""),
-            "mcp_mariadb_url": mcp.get("mcp_mariadb_url", ""),
-            "mcp_influxdb_url": mcp.get("mcp_influxdb_url", ""),
-            "mcp_tempo_url": mcp.get("mcp_tempo_url", ""),
-        }
+        servers = mcp.get("mcp_servers", {}) or {}
+        if not servers and any(key.startswith("mcp_") and key.endswith("_url") for key in mcp):
+            logging.error(
+                "config llm.mcp still uses legacy flat mcp_*_url keys; migrate to the "
+                "mcp_servers map ({name: {url, transport}}) — no MCP servers will be connected."
+            )
+        return servers
 
     def get_log_system_prompt_config(self):
         log_analysis = self.config.get("log_analysis", {})
         return {
             "system_prompt_first": log_analysis.get("system_prompt_first", ""),
             "system_prompt_default": log_analysis.get("system_prompt_default", ""),
-        }
-
-    def get_alarm_mcp_config(self):
-        mcp = self.config.get("alarm_analysis", {}).get("mcp", {})
-        return {
-            "mcp_grafana_url": mcp.get("mcp_grafana_url", ""),
-            "mcp_mariadb_url": mcp.get("mcp_mariadb_url", ""),
-            "mcp_influxdb_url": mcp.get("mcp_influxdb_url", ""),
         }
 
     def get_alarm_system_prompt_config(self):
