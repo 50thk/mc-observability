@@ -19,8 +19,8 @@ class StructuredFallbackAgent:
     with a plain-text answer instead of emitting the schema via response_format, leaving
     structured_response empty. When that happens we make one dedicated
     ``llm.with_structured_output(schema)`` call over the finished conversation to coerce
-    the result into the schema (constrained decoding on Ollama, native tool/JSON on
-    OpenAI). Providers that already return a structured_response pass straight through, so
+    the result with provider-native structured output. Providers that already return a
+    structured_response pass straight through, so
     this only adds a recovery path and never changes the successful case.
     """
 
@@ -40,9 +40,9 @@ class StructuredFallbackAgent:
         if not messages:
             return result
         try:
-            structured = await self._llm.with_structured_output(self._response_format).ainvoke(
-                [*messages, HumanMessage(content=_COERCION_PROMPT)]
-            )
+            structured = await self._llm.with_structured_output(
+                self._response_format
+            ).ainvoke([*messages, HumanMessage(content=_COERCION_PROMPT)])
         except Exception as exc:
             logger.warning("Structured-output fallback failed: %s", exc)
             return result
