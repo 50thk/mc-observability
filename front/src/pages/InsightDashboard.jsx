@@ -616,8 +616,10 @@ function RcaTab({ nsId, infraId, nodeId }) {
   async function handleSaveSchedule() {
     let request;
     try {
+      // No timeStart/timeEnd: a schedule's window comes from the slot being run, and
+      // the API rejects a stored time_range outright.
       request = buildRcaRequest({
-        query, traceId, timeStart, timeEnd, connectionId, modelName,
+        query, traceId, connectionId, modelName,
         serviceName, endpoint, statusCode, databaseName, measurement,
         filters: additionalFilters,
       }, { nsId, infraId, nodeId });
@@ -927,7 +929,7 @@ function RcaTab({ nsId, infraId, nodeId }) {
                 placeholder="Describe the incident or question to investigate" />
             </div>
             <p className="text-xs text-gray-500">
-              Provide either a Trace ID or a complete Start and End time range.
+              Start and End are optional; leave them empty to analyse the last 30 minutes. Provide both if you set either.
             </p>
             <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
               <div>
@@ -1094,6 +1096,9 @@ function RcaTab({ nsId, infraId, nodeId }) {
                   className="min-h-10 rounded-md border border-purple-600 px-4 py-2 text-sm font-semibold text-purple-700 hover:bg-purple-50 disabled:cursor-not-allowed disabled:opacity-50">
                   Save as schedule
                 </button>
+                <p className="w-full text-[11px] text-slate-500">
+                  A schedule ignores the start and end above: each run analyses the interval that just ended.
+                </p>
                 <button type="submit" disabled={busy || !connectionId || !modelName} aria-busy={busy}
                   className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-purple-600 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50">
                   {busy && (

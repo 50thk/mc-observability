@@ -1,11 +1,16 @@
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.core.graph.rca.models import IncidentScope
+from app.core.graph.rca.models import IncidentScope, IncidentTimeRange
+
+# Callers that name no window still expect an answer about "now". Materialising the
+# default here — rather than inside the graph — keeps the stored canonical request an
+# exact record of what was analysed, so replaying it reproduces the same window.
+DEFAULT_RCA_WINDOW_MINUTES = 30
 
 
 class ConnectionProviderType(str, Enum):
@@ -119,8 +124,14 @@ class PostRcaQueryBody(BaseModel):
     def validate_request(self):
         if self.session_id and (self.connection_id is not None or self.model_name is not None):
             raise ValueError("connection_id and model_name cannot override an existing session")
-        if not self.scope.trace_id and self.scope.time_range.start is None:
-            raise ValueError("trace_id or bounded time range is required")
+        if self.scope.time_range.start is None:
+            # A trace_id alone is not enough: every capability except traces.get is
+            # skipped as time_range_missing without a window.
+            end = datetime.now(UTC)
+            self.scope.time_range = IncidentTimeRange(
+                start=end - timedelta(minutes=DEFAULT_RCA_WINDOW_MINUTES),
+                end=end,
+            )
         return self
 
 
@@ -145,7 +156,17 @@ def _validated_rca_request(request: dict) -> dict:
 
     Validation must not become a transform: the schedule stores exactly what the user
     sent, so a later contract change never silently alters a saved request.
+
+    A schedule must not carry its own window. The observation window is derived from
+    the slot the run belongs to, so a stored ``time_range`` would pin every run to the
+    same frozen past — which is what ``interval_minutes`` is supposed to prevent.
     """
+    time_range = ((request or {}).get("scope") or {}).get("time_range") or {}
+    if time_range.get("start") is not None or time_range.get("end") is not None:
+        raise ValueError(
+            "schedule request must not set scope.time_range; "
+            "the window is derived from interval_minutes"
+        )
     PostRcaQueryBody.model_validate(request)
     return request
 

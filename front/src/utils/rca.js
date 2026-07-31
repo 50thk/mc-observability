@@ -19,9 +19,6 @@ export function buildRcaRequest(form = {}, context = {}) {
   if (Boolean(timeStart) !== Boolean(timeEnd)) {
     throw new Error('Start and end must be provided together.');
   }
-  if (!traceId && !timeStart) {
-    throw new Error('Trace ID or a complete time range is required.');
-  }
 
   const attributes = {};
   if (context.nsId) attributes.ns_id = context.nsId;
