@@ -64,6 +64,12 @@ def _ensure_llm_connection_schema(conn) -> None:
     )
     _ensure_column(
         conn,
+        "mc_o11y_insight_llm_connection",
+        "CONTEXT_LENGTH",
+        "`CONTEXT_LENGTH` INT(10) UNSIGNED NULL",
+    )
+    _ensure_column(
+        conn,
         "mc_o11y_insight_chat_session",
         "CONNECTION_ID",
         "`CONNECTION_ID` BIGINT(20) UNSIGNED NULL",

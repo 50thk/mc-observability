@@ -22,12 +22,26 @@ def is_official_openai_base_url(base_url: str | None) -> bool:
     return base_url is None or urlparse(base_url).hostname == "api.openai.com"
 
 
+MIN_CONTEXT_LENGTH = 1024
+MAX_CONTEXT_LENGTH = 10_000_000
+
+
 class PostConnectionBody(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     provider: ConnectionProviderType
     base_url: str | None = Field(default=None, min_length=1, pattern=r"^https?://")
     api_key: str | None = Field(default=None, min_length=1)
     default_model: str | None = Field(default=None, min_length=1, max_length=255)
+    context_length: int | None = Field(
+        default=None,
+        ge=MIN_CONTEXT_LENGTH,
+        le=MAX_CONTEXT_LENGTH,
+        description=(
+            "Input context window this endpoint actually serves, in tokens. "
+            "Ollama sizes the window from host VRAM, so the same model differs per server — "
+            "set it to what this server really allocates. Leave unset to use the configured fallback."
+        ),
+    )
     enabled: bool = True
     is_default: bool = False
 
@@ -58,6 +72,12 @@ class PatchConnectionBody(BaseModel):
     base_url: str | None = Field(default=None, min_length=1, pattern=r"^https?://")
     api_key: str | None = Field(default=None, min_length=1)
     default_model: str | None = Field(default=None, min_length=1, max_length=255)
+    context_length: int | None = Field(
+        default=None,
+        ge=MIN_CONTEXT_LENGTH,
+        le=MAX_CONTEXT_LENGTH,
+        description="Input context window in tokens; send null to clear it and use the fallback.",
+    )
     enabled: bool | None = None
 
     @model_validator(mode="after")

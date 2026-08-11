@@ -32,6 +32,7 @@ class LLMConnectionService:
         base_url: str | None,
         api_key: str | None,
         default_model: str | None,
+        context_length: int | None = None,
         enabled: bool,
         is_default: bool,
     ):
@@ -53,6 +54,7 @@ class LLMConnectionService:
                     "BASE_URL": base_url,
                     "API_KEY_ENCRYPTED": self._encrypt_api_key(api_key),
                     "DEFAULT_MODEL": default_model,
+                    "CONTEXT_LENGTH": context_length,
                     "ENABLED": enabled,
                 }
             )
@@ -100,6 +102,7 @@ class LLMConnectionService:
             "provider": "PROVIDER",
             "base_url": "BASE_URL",
             "default_model": "DEFAULT_MODEL",
+            "context_length": "CONTEXT_LENGTH",
             "enabled": "ENABLED",
         }
         updates = {
@@ -230,6 +233,7 @@ class LLMConnectionService:
             base_url=connection.BASE_URL,
             api_key_configured=bool(connection.API_KEY_ENCRYPTED),
             default_model=connection.DEFAULT_MODEL,
+            context_length=connection.CONTEXT_LENGTH,
             is_default=connection.IS_DEFAULT,
             enabled=connection.ENABLED,
             regdate=connection.REGDATE,

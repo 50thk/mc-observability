@@ -33,6 +33,10 @@ class LLMConnection(Base):
     BASE_URL = Column(Text, nullable=True)
     API_KEY_ENCRYPTED = Column(Text, nullable=True)
     DEFAULT_MODEL = Column(String(255), nullable=True)
+    # Input context window this endpoint actually serves. Belongs to the connection, not the
+    # model name: Ollama sizes the window from the host's VRAM, so the same model is 4k on one
+    # server and 256k on another. NULL means "unknown" and callers fall back with a warning.
+    CONTEXT_LENGTH = Column(Integer, nullable=True)
     IS_DEFAULT = Column(Boolean, nullable=False, default=False, server_default="0")
     ENABLED = Column(Boolean, nullable=False, default=True, server_default="1")
     REGDATE = Column(DateTime, nullable=False, server_default=func.now())

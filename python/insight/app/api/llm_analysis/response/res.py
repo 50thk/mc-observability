@@ -16,6 +16,7 @@ class LLMConnection(BaseModel):
     base_url: str | None
     api_key_configured: bool
     default_model: str | None
+    context_length: int | None = None
     is_default: bool
     enabled: bool
     regdate: datetime
