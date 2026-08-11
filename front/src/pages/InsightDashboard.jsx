@@ -1385,12 +1385,33 @@ function LlmConnectionFields({ idPrefix, value, onChange, apiKeyPlaceholder }) {
           className="w-full border rounded px-3 py-1.5 text-sm"
           placeholder={value.provider === 'ollama' ? 'llama3.1' : 'gpt-4o-mini'} />
       </div>
+      <div>
+        <label htmlFor={`${idPrefix}-context-length`} className="block text-xs text-gray-600 mb-1">Context Length</label>
+        <input id={`${idPrefix}-context-length`} type="number" min={1024} max={10000000} step={1024}
+          value={value.contextLength}
+          onChange={(e) => set({ contextLength: e.target.value })}
+          className="w-full border rounded px-3 py-1.5 text-sm"
+          placeholder="Leave empty to use the server default" />
+        <p className="mt-1 text-xs text-gray-500">
+          Input tokens this endpoint actually serves. Ollama sizes it from host VRAM, so the same
+          model differs per server. If left empty and the window cannot be detected, analysis
+          budgets assume a large window and the server may silently drop the oldest messages.
+        </p>
+      </div>
     </div>
   );
 }
 
+// '' -> null so PATCH clears the column; the API rejects anything below 1024.
+function parseContextLength(raw) {
+  const trimmed = String(raw ?? '').trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
+}
+
 function CreateLlmConnectionForm({ makeDefault, onCreated }) {
-  const [value, setValue] = useState({ name: '', provider: 'openai', baseUrl: '', apiKey: '', defaultModel: '' });
+  const [value, setValue] = useState({ name: '', provider: 'openai', baseUrl: '', apiKey: '', defaultModel: '', contextLength: '' });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -1404,6 +1425,7 @@ function CreateLlmConnectionForm({ makeDefault, onCreated }) {
       base_url: value.baseUrl.trim() || null,
       api_key: value.apiKey.trim() || null,
       default_model: value.defaultModel.trim(),
+      context_length: parseContextLength(value.contextLength),
       enabled: true,
       is_default: makeDefault,
     };
@@ -1434,6 +1456,7 @@ function EditLlmConnectionForm({ connection, onUpdated, onCancel }) {
     baseUrl: connection.base_url || '',
     apiKey: '',
     defaultModel: connection.default_model || '',
+    contextLength: connection.context_length == null ? '' : String(connection.context_length),
   });
   const [enabled, setEnabled] = useState(Boolean(connection.enabled));
   const [busy, setBusy] = useState(false);
@@ -1454,6 +1477,8 @@ function EditLlmConnectionForm({ connection, onUpdated, onCancel }) {
     if (nextBaseUrl !== (connection.base_url || null)) body.base_url = nextBaseUrl;
     if (value.apiKey.trim()) body.api_key = value.apiKey.trim();
     if (value.defaultModel.trim() !== connection.default_model) body.default_model = value.defaultModel.trim();
+    const nextContextLength = parseContextLength(value.contextLength);
+    if (nextContextLength !== (connection.context_length ?? null)) body.context_length = nextContextLength;
     if (enabled !== Boolean(connection.enabled)) body.enabled = enabled;
     if (Object.keys(body).length === 0) { setErr('Nothing changed.'); return; }
 
