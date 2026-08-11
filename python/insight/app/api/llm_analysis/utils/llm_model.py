@@ -1,5 +1,3 @@
-import os
-
 from fastapi import HTTPException, status
 from langchain_core.language_models import BaseChatModel
 from langchain_ollama import ChatOllama
@@ -7,15 +5,6 @@ from langchain_openai import ChatOpenAI
 
 from app.api.llm_analysis.request.req import is_official_openai_base_url
 from app.api.llm_analysis.utils.llm_connection import LLMConnectionService
-
-DEFAULT_OLLAMA_NUM_CTX = 32768
-
-
-def _ollama_num_ctx() -> int:
-    try:
-        return int(os.getenv("OLLAMA_NUM_CTX", str(DEFAULT_OLLAMA_NUM_CTX)))
-    except (TypeError, ValueError):
-        return DEFAULT_OLLAMA_NUM_CTX
 
 
 def create_chat_model(repo, model_name: str, connection_id: int | None) -> BaseChatModel:
@@ -50,11 +39,13 @@ def create_chat_model(repo, model_name: str, connection_id: int | None) -> BaseC
                 detail="ollama base_url is not configured",
                 status_code=status.HTTP_409_CONFLICT,
             )
+        # num_ctx is per-request and never reported back, so a declared window has to be
+        # sent to be real. Unset: Ollama sizes from VRAM and callers fall back.
         return ChatOllama(
             model=model_name,
             base_url=base_url,
             temperature=0,
-            num_ctx=_ollama_num_ctx(),
+            **({"num_ctx": connection.CONTEXT_LENGTH} if connection.CONTEXT_LENGTH else {}),
         )
 
     api_key = LLMConnectionService(repo.db).decrypt_api_key(connection)

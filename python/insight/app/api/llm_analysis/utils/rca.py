@@ -49,21 +49,69 @@ def _summarize_token_usage(usage_metadata: dict | None) -> dict:
     return {key: value for key, value in totals.items() if value}
 
 
-def _derive_token_budgets(llm, analysis_config: dict) -> dict[str, int]:
-    context_window = getattr(llm, "num_ctx", None)
-    if not isinstance(context_window, (int, float)) or context_window <= 0:
-        profile = getattr(llm, "profile", None)
-        context_window = (
-            profile.get("max_input_tokens")
-            if isinstance(profile, dict)
-            else None
+_FALLBACK_CONTEXT_WINDOW_TOKENS = 200_000
+# Warn once per model so a busy endpoint does not repeat the same line every request.
+_warned_unknown_context: set[str] = set()
+
+
+def _positive_int(value) -> int | None:
+    return int(value) if isinstance(value, (int, float)) and value > 0 else None
+
+
+def _resolve_context_window(
+    llm,
+    analysis_config: dict,
+    *,
+    explicit_context_length: int | None,
+    model_name: str,
+) -> int:
+    """Resolve the input context window, preferring what the operator declared.
+
+    The window is a property of the *endpoint*, not of the model name: Ollama sizes it
+    from the host's VRAM, so one server serves a model at 4k and another at 256k. No
+    registry can know that, which is why the connection's own value wins over anything
+    we can infer, and why an unknown window warns instead of failing quietly.
+    """
+    if declared := _positive_int(explicit_context_length):
+        return declared
+    # num_ctx is the window create_chat_model sent to Ollama; profile is langchain's
+    # catalogue, which is empty for custom endpoints.
+    profile = getattr(llm, "profile", None)
+    for candidate in (
+        getattr(llm, "num_ctx", None),
+        profile.get("max_input_tokens") if isinstance(profile, dict) else None,
+    ):
+        if known := _positive_int(candidate):
+            return known
+
+    fallback = _positive_int(
+        analysis_config.get("fallback_context_window_tokens")
+    ) or _FALLBACK_CONTEXT_WINDOW_TOKENS
+    if model_name not in _warned_unknown_context:
+        _warned_unknown_context.add(model_name)
+        logger.warning(
+            "Unknown context window for model %r; assuming %d tokens. If this endpoint "
+            "serves less, the server will silently drop the oldest messages. Set the "
+            "connection's context_length to the window it actually allocates.",
+            model_name or "<unnamed>",
+            fallback,
         )
-    if not isinstance(context_window, (int, float)) or context_window <= 0:
-        context_window = analysis_config.get(
-            "fallback_context_window_tokens",
-            32_768,
-        )
-    context_window = int(context_window)
+    return fallback
+
+
+def _derive_token_budgets(
+    llm,
+    analysis_config: dict,
+    *,
+    explicit_context_length: int | None = None,
+    model_name: str = "",
+) -> dict[str, int]:
+    context_window = _resolve_context_window(
+        llm,
+        analysis_config,
+        explicit_context_length=explicit_context_length,
+        model_name=model_name,
+    )
     single_tool_max = min(
         int(
             context_window
@@ -244,7 +292,17 @@ class RcaAnalysisService:
             model_name,
             connection_id=connection_id,
         )
-        token_budgets = _derive_token_budgets(llm, self.analysis_config)
+        connection = (
+            self.session_repo.get_connection_by_id(connection_id)
+            if connection_id is not None
+            else None
+        )
+        token_budgets = _derive_token_budgets(
+            llm,
+            self.analysis_config,
+            explicit_context_length=getattr(connection, "CONTEXT_LENGTH", None),
+            model_name=model_name,
+        )
         return RcaRunContext(
             analysis_config={
                 **self.analysis_config,
@@ -266,13 +324,11 @@ class RcaAnalysisService:
         *,
         storage_dir: Path | None = None,
         model_name: str = "gpt-4",
-        token_budgets: dict[str, int] | None = None,
+        token_budgets: dict[str, int],
     ):
+        # Budgets are always derived once in _create_rca_context, with the connection's
+        # declared context_length. Re-deriving here would silently drop that declaration.
         collectors = {}
-        token_budgets = token_budgets or _derive_token_budgets(
-            llm,
-            self.analysis_config,
-        )
         evidence_store = EvidenceStore(
             storage_dir=storage_dir,
             model_name=model_name,

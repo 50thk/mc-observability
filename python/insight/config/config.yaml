@@ -195,7 +195,10 @@ rca_analysis:
   subagent_model_call_limit: 12
   subagent_tool_call_limit: 10
   subagent_tool_retry_max_retries: 2
-  fallback_context_window_tokens: 32768
+  # Used only when neither the LLM connection's context_length nor the provider knows the
+  # window. Optimistic on purpose: an under-guess wastes a large model's capacity silently,
+  # while an over-guess is announced by a warning log naming the connection to fix.
+  fallback_context_window_tokens: 200000
   tool_result_context_window_pct: 15
   tool_result_absolute_max_tokens: 25000
   synthesis_system_prompt: |
