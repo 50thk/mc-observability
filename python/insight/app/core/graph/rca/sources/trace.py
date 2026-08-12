@@ -65,7 +65,6 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             return await context.invoke(search_tool, "traceql-search", backend_args)
 
         return await context.run(
-            source="trace",
             name="search_traces",
             args={"traceql": traceql, "limit": bounded},
             evidence_query=True,
@@ -83,7 +82,6 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             return summarize_trace(raw, trace_id)
 
         return await context.run(
-            source="trace",
             name="get_trace",
             args=backend_args,
             evidence_query=True,
@@ -100,7 +98,6 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             return await context.invoke(attribute_values_tool, "get-attribute-values", backend_args)
 
         return await context.run(
-            source="trace",
             name="list_trace_attribute_values",
             args={"attribute": attribute},
             evidence_query=False,

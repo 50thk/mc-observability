@@ -29,13 +29,15 @@ from app.core.graph.rca import (
     build_investigation_runner,
     build_investigation_toolset,
 )
-from app.core.graph.utils.tool_policy import filter_tools_by_allowlist
 from config.ConfigManager import ConfigManager
 
 logger = logging.getLogger(__name__)
 
 _EVIDENCE_RECORD_CONTEXT_RATIO = 0.60
 _SYNTHESIS_EVIDENCE_CONTEXT_RATIO = 0.80
+# The tool-call ledger is bounded by the request budget, but a model that keeps issuing
+# blocked calls can still grow it; the record keeps the head and says what was cut.
+_MAX_PERSISTED_TOOL_CALLS = 100
 
 
 def _summarize_token_usage(usage_metadata: dict | None) -> dict:
@@ -46,7 +48,6 @@ def _summarize_token_usage(usage_metadata: dict | None) -> dict:
     return {key: value for key, value in totals.items() if value}
 
 
-_FALLBACK_CONTEXT_WINDOW_TOKENS = 200_000
 # Warn once per model so a busy endpoint does not repeat the same line every request.
 _warned_unknown_context: set[str] = set()
 
@@ -81,9 +82,10 @@ def _resolve_context_window(
         if known := _positive_int(candidate):
             return known
 
-    fallback = _positive_int(
-        analysis_config.get("fallback_context_window_tokens")
-    ) or _FALLBACK_CONTEXT_WINDOW_TOKENS
+    # The default lives in ConfigManager only; an absent key is a configuration bug.
+    fallback = _positive_int(analysis_config["fallback_context_window_tokens"])
+    if fallback is None:
+        raise ValueError("rca_analysis.fallback_context_window_tokens must be a positive integer")
     if model_name not in _warned_unknown_context:
         _warned_unknown_context.add(model_name)
         logger.warning(
@@ -129,6 +131,17 @@ def _derive_token_budgets(
     }
 
 
+def _persisted_tool_calls(context) -> dict:
+    toolset = getattr(context, "investigation_toolset", None)
+    if toolset is None:
+        return {"tool_calls": []}
+    ledger = toolset.ledger()
+    persisted = {"tool_calls": ledger[:_MAX_PERSISTED_TOOL_CALLS]}
+    if len(ledger) > _MAX_PERSISTED_TOOL_CALLS:
+        persisted["tool_calls_truncated"] = len(ledger) - _MAX_PERSISTED_TOOL_CALLS
+    return persisted
+
+
 class RcaAnalysisService:
     """Coordinate RCA API operations, agents, graph execution, and persistence."""
 
@@ -166,6 +179,7 @@ class RcaAnalysisService:
             request_json=request_json,
         )
 
+        context = None
         try:
             with TemporaryDirectory(prefix=f"rca-{record.ID}-") as directory:
                 context = await self._create_rca_context(
@@ -197,12 +211,13 @@ class RcaAnalysisService:
                 record.ID,
                 status="FAILED",
                 summary=error_message,
-                detail={"error_message": error_message},
+                detail={"error_message": error_message, **_persisted_tool_calls(context)},
             )
             self._log_operational_summary(
                 record.ID,
                 started_at,
                 {"result_validation": {"status": "FAILED"}, "error_message": error_message},
+                context,
             )
             raise
 
@@ -212,6 +227,9 @@ class RcaAnalysisService:
             "result_validation": graph_result.get("result_validation"),
             "evidence_status": merged_evidence.get("sources") or {},
             "errors": [graph_result["error_message"]] if graph_result.get("error_message") else [],
+            # Every wrapped tool call of the request — including empty, blocked and failed
+            # ones — so the record explains what was looked at, not only what was cited.
+            **_persisted_tool_calls(context),
         }
         analysis_result = graph_result.get("analysis_result") or {}
         summary = analysis_result.get("summary") or graph_result.get("error_message") or ""
@@ -239,7 +257,7 @@ class RcaAnalysisService:
             summary=summary,
             detail=detail,
         )
-        self._log_operational_summary(record.ID, started_at, graph_result)
+        self._log_operational_summary(record.ID, started_at, graph_result, context)
 
         return RcaQueryResult(
             session_id=session.SESSION_ID,
@@ -343,35 +361,43 @@ class RcaAnalysisService:
         )
 
     def _source_tools(self) -> dict[str, dict]:
-        """Raw MCP tools per source, for the sources whose required tools are all present."""
+        """Allowlisted raw MCP tools per source, for the sources whose required tools are all present."""
+        if not self.mcp_manager or not hasattr(self.mcp_manager, "get_tools_for_mcp"):
+            return {}
         available = {}
         for source, spec in SOURCE_SPECS.items():
-            tools = self._get_tools_for_mcp(spec["mcp"], (*spec["required_tools"], *spec["optional_tools"]))
-            by_name = {tool.name: tool for tool in tools if getattr(tool, "name", "")}
+            allowed = {*spec["required_tools"], *spec["optional_tools"]}
+            by_name = {
+                tool.name: tool
+                for tool in self.mcp_manager.get_tools_for_mcp(spec["mcp"])
+                if getattr(tool, "name", "") in allowed
+            }
             if set(spec["required_tools"]).issubset(by_name):
                 available[source] = by_name
         return available
 
-    def _get_tools_for_mcp(self, mcp_name: str, allowed_tools=()):
-        """Return policy-filtered tools for one MCP server name."""
-        if not self.mcp_manager or not hasattr(self.mcp_manager, "get_tools_for_mcp"):
-            return []
-        return filter_tools_by_allowlist(self.mcp_manager.get_tools_for_mcp(mcp_name), allowed_tools)
-
     @staticmethod
-    def _log_operational_summary(analysis_id: int, started_at: float, graph_result: dict):
-        """Emit one bounded RCA operation log line per analysis."""
+    def _log_operational_summary(analysis_id: int, started_at: float, graph_result: dict, context=None):
+        """Emit one bounded RCA operation log line per analysis.
+
+        ``tool_calls`` carries per-source call counts and durations from the request's
+        toolset; it is the measurement the deadline and budget defaults are tuned from.
+        """
         duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
         evidence_status = ((graph_result.get("merged_evidence") or {}).get("sources")) or {}
         result_status = ((graph_result.get("result_validation") or {}).get("status")) or "UNKNOWN"
         llm_tokens = graph_result.get("llm_token_usage") or {}
+        toolset = getattr(context, "investigation_toolset", None)
+        tool_calls = toolset.call_summary() if toolset is not None else {}
         logger.info(
-            "rca_analysis_completed analysis_id=%s duration_ms=%s llm_tokens=%s evidence_status=%s result_status=%s",
+            "rca_analysis_completed analysis_id=%s duration_ms=%s llm_tokens=%s evidence_status=%s "
+            "result_status=%s tool_calls=%s",
             analysis_id,
             duration_ms,
             llm_tokens,
             evidence_status,
             result_status,
+            tool_calls,
         )
 
     @staticmethod

@@ -16,7 +16,6 @@ from .investigation import (
     investigation_fixed_tokens,
 )
 from .models import (
-    EVIDENCE_SOURCES,
     DraftEvidencePlan,
     IncidentScope,
     RcaAnalysisState,
@@ -30,7 +29,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_QUERY = "Analyze the incident and identify the most probable evidence-backed cause."
 _MAX_INVESTIGATION_ROUNDS = 1
 _TRIM_NOTE_TOKENS = 64
-_FALLBACK_CONTEXT_WINDOW_TOKENS = 200_000
 _MAX_NOTE_CHARS = 2_000
 # A source the agent chose not to query is not a gap; a source that could not be offered is.
 _NOT_QUERIED = "not_queried"
@@ -45,10 +43,9 @@ class RcaGraphNodes:
         context = runtime.context
         scope = IncidentScope.model_validate(state.get("scope") or {})
         scope = _scope_with_discovered_trace(scope, state.get("merged_evidence"))
-        toolset = context.investigation_toolset
-        available = list(toolset.queryable_sources) if toolset is not None else []
+        available = list(context.investigation_toolset.queryable_sources)
         reinvestigating = bool(state.get("evidence_gaps"))
-        draft = await _draft_plan(context.llm, state, scope, available)
+        draft = await _draft_plan(context.llm, state, scope, available, context.investigation_toolset.ledger())
         hypotheses = list(dict.fromkeys([*state.get("hypotheses", []), *draft.hypotheses]))[:5]
         return {
             "query": state.get("query") or _DEFAULT_QUERY,
@@ -77,7 +74,8 @@ class RcaGraphNodes:
 
         runner = context.investigation_runner
         budget = context.budget
-        if toolset is not None and runner is not None and toolset.queryable_sources:
+        previous = state.get("merged_evidence") or {}
+        if runner is not None and toolset.queryable_sources:
             if budget is not None and budget.expired:
                 limitations.append({"source": "investigation", "reason": "request_deadline_exceeded"})
             elif budget is not None and budget.remaining_model_calls == 0:
@@ -90,8 +88,8 @@ class RcaGraphNodes:
                     hypotheses=list(state.get("hypotheses") or []),
                     hints=list(plan.get("hints") or []),
                     available_sources=list(toolset.queryable_sources),
-                    prior_evidence_catalog=list(state.get("prior_evidence_catalog") or []),
-                    prior_tool_calls=list(state.get("prior_tool_calls") or []),
+                    prior_evidence_catalog=list(previous.get("evidence_catalog") or []),
+                    prior_tool_calls=toolset.ledger(),
                     evidence_gaps=list(state.get("evidence_gaps") or []),
                     investigation_round=int(state.get("investigation_round", 0)),
                 )
@@ -99,7 +97,7 @@ class RcaGraphNodes:
                 try:
                     fitted = fit_investigation_payload(
                         payload,
-                        max_tokens=int(config.get("context_window_tokens") or _FALLBACK_CONTEXT_WINDOW_TOKENS),
+                        max_tokens=int(config["context_window_tokens"]),
                         fixed_tokens=investigation_fixed_tokens(toolset, model_name),
                         model_name=model_name,
                     )
@@ -116,25 +114,14 @@ class RcaGraphNodes:
                         logger.warning("RCA investigation runner failed: %s", exc)
                         limitations.append({"source": "investigation", "reason": "investigation_runner_failed"})
 
-        if toolset is not None:
-            items = [result.model_dump(mode="json") for result in toolset.source_results(list(EVIDENCE_SOURCES))]
-            prior_tool_calls = toolset.ledger()
-        else:
-            items = [
-                {"source": source, "status": "SKIPPED", "limitations": ["source_unavailable"], "records": []}
-                for source in EVIDENCE_SOURCES
-            ]
-            prior_tool_calls = []
-        merged = _build_merged_evidence(items, list(plan.get("skipped") or []))
-        merged["limitations"] = _deduplicate([*merged["limitations"], *limitations])
+        merged = _build_merged_evidence(toolset)
+        merged["limitations"].extend(entry for entry in limitations if entry not in merged["limitations"])
         if blocked_reason:
             merged["synthesis_blocked_reason"] = blocked_reason
         if notes:
             merged["investigation_notes"] = notes[:_MAX_NOTE_CHARS]
         update: dict[str, Any] = {
             "merged_evidence": merged,
-            "prior_evidence_catalog": list(merged["evidence_catalog"]),
-            "prior_tool_calls": prior_tool_calls,
             "investigation_budget": {
                 "model_calls": budget.remaining_model_calls if budget is not None else None,
                 "tool_calls": budget.remaining_tool_calls if budget is not None else None,
@@ -242,31 +229,24 @@ def _final_note(result: Any) -> str | None:
     return None
 
 
-def _deduplicate(items: list[Any]) -> list[Any]:
-    unique: list[Any] = []
-    seen: set[str] = set()
-    for item in items:
-        fingerprint = json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
-        if fingerprint not in seen:
-            seen.add(fingerprint)
-            unique.append(item)
-    return unique
+def _build_merged_evidence(toolset) -> dict[str, Any]:
+    """Project the store into what synthesis and validation read.
 
-
-def _build_merged_evidence(items: list[dict[str, Any]], skipped: list[dict[str, Any]]) -> dict[str, Any]:
-    """Project the store into what synthesis and validation read: one item per source."""
-    limitations = [
-        {"source": item["source"], "reason": reason} for item in items for reason in item.get("limitations", [])
-    ]
-    limitations.extend(skipped)
+    Records live in ``evidence_catalog`` only; per-source status and source-tagged
+    limitations are what the validator needs, and the tool traces stay with the toolset
+    for the operational log.
+    """
+    statuses = toolset.source_statuses()
     return {
-        "items": items,
-        "evidence_catalog": _build_evidence_catalog(items),
-        "sources": _source_statuses(items),
-        "limitations": _deduplicate(limitations),
-        "discovered_trace_ids": sorted(
-            {trace_id for item in items for trace_id in item.get("discovered_trace_ids", [])}
-        ),
+        "sources": {item.source: item.status for item in statuses},
+        "limitations": [{"source": item.source, "reason": reason} for item in statuses for reason in item.limitations],
+        "evidence_catalog": [
+            record.model_dump(mode="json")
+            for item in statuses
+            if item.status in {"OK", "PARTIAL"}
+            for record in toolset.evidence_store.records_for(item.source)
+        ],
+        "discovered_trace_ids": sorted(set(toolset.discovered_trace_ids)),
     }
 
 
@@ -283,7 +263,11 @@ def _fit_synthesis_evidence(
     costs a few records and keeps the conclusion. Only a payload that cannot hold a
     single record still blocks.
     """
-    if _synthesis_tokens(merged, model_name) <= max_tokens:
+
+    def tokens(candidate: dict[str, Any]) -> int:
+        return count_tokens(_compact_json(_synthesis_evidence(candidate)), model_name)
+
+    if tokens(merged) <= max_tokens:
         return merged
 
     # The trim limitation is appended after fitting, so leave room for it.
@@ -291,7 +275,7 @@ def _fit_synthesis_evidence(
     catalog = merged.get("evidence_catalog") or []
     # Price each record once against the empty-catalog payload instead of re-counting
     # the whole payload per record; the exact total is verified below.
-    used = _synthesis_tokens({**merged, "evidence_catalog": []}, model_name)
+    used = tokens({**merged, "evidence_catalog": []})
     kept: list[dict[str, Any]] = []
     for record in _interleave_by_source(catalog):
         size = count_tokens(_compact_json(record), model_name)
@@ -299,7 +283,7 @@ def _fit_synthesis_evidence(
             continue
         kept.append(record)
         used += size
-    while kept and _synthesis_tokens({**merged, "evidence_catalog": kept}, model_name) > max_tokens:
+    while kept and tokens({**merged, "evidence_catalog": kept}) > max_tokens:
         kept.pop()
 
     dropped = len(catalog) - len(kept)
@@ -330,10 +314,6 @@ def _interleave_by_source(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]
     return ordered
 
 
-def _synthesis_tokens(merged: dict[str, Any], model_name: str) -> int:
-    return count_tokens(_compact_json(_synthesis_evidence(merged)), model_name)
-
-
 def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -346,37 +326,12 @@ def _synthesis_evidence(merged: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _build_evidence_catalog(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    catalog: list[dict[str, Any]] = []
-    order = {source: index for index, source in enumerate(EVIDENCE_SOURCES)}
-    for item in sorted(items, key=lambda value: order.get(value["source"], len(order))):
-        if item.get("status") not in {"OK", "PARTIAL"}:
-            continue
-        catalog.extend(item.get("records", []))
-    return catalog
-
-
-def _source_statuses(items: list[dict[str, Any]]) -> dict[str, str]:
-    rank = {"OK": 0, "NO_DATA": 1, "PARTIAL": 1, "SKIPPED": 2, "FAILED": 3}
-    statuses = {}
-    for item in items:
-        source = item["source"]
-        status = item["status"]
-        if source not in statuses or rank.get(status, 3) > rank.get(statuses[source], 3):
-            statuses[source] = status
-    return statuses
-
-
-def _append_unique(items: list[str], value: str) -> None:
-    if value not in items:
-        items.append(value)
-
-
 async def _draft_plan(
     llm,
     state: RcaAnalysisState,
     scope: IncidentScope,
     available_sources: list[str],
+    prior_tool_calls: list[dict[str, Any]],
 ) -> DraftEvidencePlan:
     if llm is None:
         return DraftEvidencePlan()
@@ -410,9 +365,9 @@ async def _draft_plan(
                             "evidence_gaps": state.get("evidence_gaps") or [],
                             "prior_evidence_catalog": [
                                 {key: item.get(key) for key in ("evidence_id", "source", "tool")}
-                                for item in (state.get("prior_evidence_catalog") or [])
+                                for item in ((state.get("merged_evidence") or {}).get("evidence_catalog") or [])
                             ],
-                            "prior_tool_calls": state.get("prior_tool_calls") or [],
+                            "prior_tool_calls": prior_tool_calls,
                         },
                         ensure_ascii=False,
                         default=str,
@@ -446,8 +401,9 @@ def build_rca_graph(*, checkpointer=None):
 
 def _validate_result(result: dict | None, merged_evidence: dict | None, analysis_config: dict) -> dict[str, Any]:
     merged_evidence = merged_evidence or {}
-    evidence = merged_evidence.get("items", [])
-    usable_sources = {item["source"] for item in evidence if item.get("status") in {"OK", "PARTIAL"}}
+    sources: dict[str, str] = merged_evidence.get("sources") or {}
+    limitations = merged_evidence.get("limitations") or []
+    usable_sources = {source for source, status in sources.items() if status in {"OK", "PARTIAL"}}
     catalog = {
         item["evidence_id"]: item
         for item in merged_evidence.get("evidence_catalog", [])
@@ -455,25 +411,12 @@ def _validate_result(result: dict | None, merged_evidence: dict | None, analysis
     }
     threshold = analysis_config.get("partial_confidence_threshold", 0.4)
     confidence = result.get("confidence") if isinstance(result, dict) else None
-    execution_reasons = _execution_reasons(
-        result,
-        evidence,
-        usable_sources,
-        merged_evidence.get("limitations", []),
-        confidence,
-    )
+    execution_reasons = _execution_reasons(result, sources, limitations)
     # An empty catalog because every queried source ran and found nothing is a finding, not
     # a broken analysis. Only a source that actually failed makes the run unusable.
-    no_telemetry = (
-        bool(evidence)
-        and all(item.get("status") in {"NO_DATA", "SKIPPED"} for item in evidence)
-        and any(item.get("status") == "NO_DATA" for item in evidence)
-    )
+    no_telemetry = all(status in {"NO_DATA", "SKIPPED"} for status in sources.values()) and "NO_DATA" in sources.values()
     if not catalog:
-        _append_unique(
-            execution_reasons,
-            "no telemetry data in the requested window" if no_telemetry else "no usable evidence",
-        )
+        execution_reasons.append("no telemetry data in the requested window" if no_telemetry else "no usable evidence")
         result = None
     conclusion_reasons: list[str] = []
     evidence_gaps: list[str] = []
@@ -507,7 +450,7 @@ def _validate_result(result: dict | None, merged_evidence: dict | None, analysis
             "conclusion_reasons": conclusion_reasons,
             "confidence": result.get("confidence") if isinstance(result, dict) else confidence,
             "confidence_threshold": threshold,
-            "evidence_count": len(evidence),
+            "evidence_count": len(sources),
             "usable_evidence_count": len(catalog),
             "conclusion_strength": (
                 result.get("conclusion_strength") if isinstance(result, dict) else "INCONCLUSIVE"
@@ -516,37 +459,26 @@ def _validate_result(result: dict | None, merged_evidence: dict | None, analysis
     }
 
 
-def _execution_reasons(
-    result: dict | None,
-    evidence: list[dict[str, Any]],
-    usable_sources: set[str],
-    limitations: list[Any],
-    confidence: Any,
-) -> list[str]:
+def _execution_reasons(result: dict | None, sources: dict[str, str], limitations: list[Any]) -> list[str]:
     reasons = []
     if not result:
         reasons.append("missing result")
-    if not evidence:
-        reasons.append("missing evidence")
-    elif not usable_sources:
-        reasons.append("no usable evidence")
-    for item in evidence:
-        status = item.get("status")
+    by_source: dict[str, set[str]] = {}
+    for limitation in limitations:
+        if isinstance(limitation, dict):
+            by_source.setdefault(str(limitation.get("source")), set()).add(str(limitation.get("reason")))
+    for source, status in sources.items():
         if status in {"OK", "NO_DATA"}:
             # NO_DATA ran to completion — an empty window is a finding, not an execution gap.
             continue
         if status == "SKIPPED":
             # The agent choosing not to query a source is not a gap; a source that could
             # not be offered at all is.
-            if set(item.get("limitations") or []) - {_NOT_QUERIED}:
-                reasons.append(f"source unavailable: {item.get('source')}")
+            if by_source.get(source, set()) - {_NOT_QUERIED}:
+                reasons.append(f"source unavailable: {source}")
             continue
-        reasons.append(f"incomplete evidence: {item.get('source')}")
-    for limitation in limitations:
-        if isinstance(limitation, dict) and limitation.get("source") == "investigation":
-            reasons.append(f"investigation incomplete: {limitation.get('reason')}")
-    if confidence is None:
-        reasons.append("missing confidence")
+        reasons.append(f"incomplete evidence: {source}")
+    reasons.extend(f"investigation incomplete: {reason}" for reason in sorted(by_source.get("investigation", ())))
     return reasons
 
 
@@ -559,7 +491,7 @@ def _ground_result_references(
     result["evidence"] = [
         grounded
         for item in result.get("evidence", [])
-        if (grounded := _ground_reference(item, catalog, execution_reasons, "evidence")) is not None
+        if (grounded := _ground_reference(item, catalog, execution_reasons)) is not None
     ]
     grounded_hypotheses = []
     for hypothesis in result.get("hypotheses", []):
@@ -667,15 +599,14 @@ def _ground_reference(
     reference: dict[str, Any],
     catalog: dict[str, dict[str, str]],
     reasons: list[str],
-    kind: str,
 ) -> dict[str, Any] | None:
     evidence_id = reference.get("evidence_id")
     catalog_item = catalog.get(evidence_id)
     if catalog_item is None:
-        reasons.append(f"ungrounded {kind}_id: {evidence_id}")
+        reasons.append(f"ungrounded evidence_id: {evidence_id}")
         return None
     if reference.get("source") != catalog_item["source"]:
-        reasons.append(f"{kind} source mismatch: {evidence_id}")
+        reasons.append(f"evidence source mismatch: {evidence_id}")
         return None
     return {**reference}
 
@@ -697,8 +628,8 @@ def validate_plan(
 ) -> dict[str, Any]:
     """Keep the planner's hints for sources the agent can actually query.
 
-    Hints are not a branching unit any more: the central agent decides the calls. A hint
-    for a source that is not offered becomes a recorded skip so the result explains itself.
+    Hints are not a branching unit any more: the central agent decides the calls, and the
+    toolset already records why a source is not offered.
     """
     if not isinstance(draft, DraftEvidencePlan):
         try:
@@ -707,16 +638,8 @@ def validate_plan(
             draft = DraftEvidencePlan()
     available = set(available_sources)
     hints: list[dict[str, str]] = []
-    skipped: list[dict[str, str]] = []
     for task in draft.tasks:
-        if task.source not in EVIDENCE_SOURCES:
-            continue
-        if task.source not in available:
-            entry = {"source": task.source, "reason": "source_unavailable"}
-            if entry not in skipped:
-                skipped.append(entry)
-            continue
         hint = {"source": task.source, "focus": task.focus}
-        if hint not in hints:
+        if task.source in available and hint not in hints:
             hints.append(hint)
-    return {"hints": hints, "skipped": skipped}
+    return {"hints": hints}

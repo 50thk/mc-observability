@@ -17,7 +17,6 @@ DEFAULT_RECORD_BUDGET_TOKENS = 19_660
 
 @dataclass(frozen=True, slots=True)
 class _Artifact:
-    reference: str
     path: Path
     source: str
     tool: str
@@ -73,7 +72,6 @@ class EvidenceStore:
         record = EvidenceRecord(
             evidence_id=reference,
             source=source,
-            signal=tool,
             observation=canonical,
             tool=tool,
             query=dict(query),
@@ -194,7 +192,6 @@ class EvidenceStore:
         record = EvidenceRecord(
             evidence_id=f"{artifact.source}:{view_digest}",
             source=artifact.source,
-            signal=artifact.tool,
             observation=observation,
             tool=artifact.tool,
             query=artifact.query,
@@ -243,7 +240,6 @@ class EvidenceStore:
             if reference not in self._artifacts:
                 path.write_text(canonical, encoding="utf-8")
                 self._artifacts[reference] = _Artifact(
-                    reference=reference,
                     path=path,
                     source=source,
                     tool=tool,

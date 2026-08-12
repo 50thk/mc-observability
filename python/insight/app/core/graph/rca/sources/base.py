@@ -35,7 +35,6 @@ class SourceContext(Protocol):
     async def run(
         self,
         *,
-        source: str,
         name: str,
         args: dict[str, Any],
         evidence_query: bool,

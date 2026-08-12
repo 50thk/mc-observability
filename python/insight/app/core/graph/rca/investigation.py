@@ -24,7 +24,7 @@ from langchain_core.tools import StructuredTool
 from app.core.graph.utils.token_counter import count_tokens
 
 from .evidence_store import EvidenceStore
-from .models import EVIDENCE_SOURCES, EvidenceResult, IncidentScope, RequestBudget, ToolTraceEntry
+from .models import EVIDENCE_SOURCES, IncidentScope, RequestBudget, ToolTraceEntry
 from .sources import SOURCE_ADAPTERS, SourceUnavailableError
 from .sources.base import is_empty_payload, unwrap_mcp_output, walk_dicts
 from .specs import SOURCE_SPECS
@@ -88,12 +88,20 @@ gone, and end with a short note of what you observed and what could not be check
 
 
 @dataclass(slots=True)
+class SourceStatus:
+    """What the graph needs to know about one source after a round."""
+
+    source: str
+    status: str
+    limitations: list[str]
+
+
+@dataclass(slots=True)
 class _CallRecord:
     tool: str
     source: str
     args: dict[str, Any]
     status: str
-    evidence_query: bool
     duration_ms: float
     evidence_ref: str | None = None
 
@@ -104,24 +112,20 @@ class _SourceBinding:
 
     toolset: "InvestigationToolset"
     source: str
+    scope: IncidentScope
     tools: Mapping[str, Any]
     datasources: Mapping[str, str]
-
-    @property
-    def scope(self) -> IncidentScope:
-        return self.toolset.scope
 
     async def run(
         self,
         *,
-        source: str,
         name: str,
         args: dict[str, Any],
         evidence_query: bool,
         execute: Callable[[], Awaitable[Any]],
     ) -> Any:
         return await self.toolset.run(
-            source=source or self.source,
+            source=self.source,
             name=name,
             args=args,
             evidence_query=evidence_query,
@@ -139,17 +143,12 @@ class InvestigationToolset:
         scope: IncidentScope,
         evidence_store: EvidenceStore,
         budget: RequestBudget | None = None,
-        timeouts: Mapping[str, float] | None = None,
-        specs: Mapping[str, Mapping[str, Any]] = SOURCE_SPECS,
     ):
         self.scope = scope
         self.evidence_store = evidence_store
         self.budget = budget
-        self._timeouts = dict(timeouts or {})
-        self._specs = specs
         self.tools: list[StructuredTool] = []
         self.tool_sources: dict[str, str] = {}
-        self._source_datasources: dict[str, dict[str, str]] = {}
         self.allowed_refs: set[str] = set()
         self.discovered_trace_ids: list[str] = []
         self._seen_calls: set[str] = set()
@@ -164,11 +163,7 @@ class InvestigationToolset:
     # --- construction -----------------------------------------------------------------
 
     def bind(self, source: str, tools: Mapping[str, Any], datasources: Mapping[str, str]) -> _SourceBinding:
-        self._source_datasources[source] = dict(datasources)
-        return _SourceBinding(self, source, tools, dict(datasources))
-
-    def datasources_for(self, source: str) -> dict[str, str]:
-        return dict(self._source_datasources.get(source, {}))
+        return _SourceBinding(self, source, self.scope, tools, dict(datasources))
 
     @property
     def queryable_sources(self) -> list[str]:
@@ -212,8 +207,7 @@ class InvestigationToolset:
                     source=source,
                     args=dict(args),
                     status=status,
-                    evidence_query=evidence_query,
-                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                    duration_ms=(time.perf_counter() - started) * 1000,
                     evidence_ref=evidence_ref,
                 )
             )
@@ -283,13 +277,7 @@ class InvestigationToolset:
         """Call one raw MCP tool, unwrap its envelope and trace the call under ``source``."""
         started = time.perf_counter()
         try:
-            if hasattr(tool, "ainvoke"):
-                raw = await tool.ainvoke(dict(args))
-            else:
-                raw = tool(dict(args))
-                if asyncio.iscoroutine(raw):
-                    raw = await raw
-            output = unwrap_mcp_output(raw)
+            output = unwrap_mcp_output(await tool.ainvoke(dict(args)))
         except Exception as exc:
             self._traces[source].append(
                 ToolTraceEntry(
@@ -319,12 +307,13 @@ class InvestigationToolset:
                 "source": record.source,
                 "args": record.args,
                 "status": record.status,
+                "duration_ms": round(record.duration_ms, 1),
                 **({"evidence_ref": record.evidence_ref} if record.evidence_ref else {}),
             }
             for record in self._ledger
         ]
 
-    def source_result(self, source: str) -> EvidenceResult:
+    def source_status(self, source: str) -> SourceStatus:
         records = self.evidence_store.records_for(source)
         limitations = [*self._skipped[source], *self._failures[source]]
         if self.evidence_store.has_uninspected(source):
@@ -349,26 +338,35 @@ class InvestigationToolset:
             status = "SKIPPED"
             if not limitations:
                 limitations = ["not_queried"]
-        return EvidenceResult(
-            source=source,
-            status=status,
-            truncated=any(reason in limitations for reason in ("spilled_evidence_not_inspected", "evidence_budget_exhausted")),
-            limitations=limitations,
-            discovered_trace_ids=list(self.discovered_trace_ids),
-            tool_trace=list(self._traces[source]),
-            records=records,
-        )
+        return SourceStatus(source=source, status=status, limitations=limitations)
 
-    def source_results(self, sources: list[str]) -> list[EvidenceResult]:
-        wanted = [source for source in EVIDENCE_SOURCES if source in set(sources) | set(self._attempted) | set(self._skipped)]
-        return [self.source_result(source) for source in wanted]
+    def source_statuses(self) -> list[SourceStatus]:
+        return [self.source_status(source) for source in EVIDENCE_SOURCES]
+
+    def traces(self, source: str) -> list[ToolTraceEntry]:
+        return list(self._traces[source])
+
+    def call_summary(self) -> dict[str, dict[str, Any]]:
+        """Per-source wrapped-call counts and durations for the request's operational log line."""
+        summary: dict[str, dict[str, Any]] = {}
+        for source in dict.fromkeys(record.source for record in self._ledger):
+            records = [record for record in self._ledger if record.source == source]
+            durations = sorted(record.duration_ms for record in records)
+            summary[source] = {
+                "calls": len(records),
+                "failures": sum(record.status.startswith("ERROR:") for record in records),
+                "timeouts": sum(
+                    record.status in ("ERROR:tool_timeout", "ERROR:request_deadline_exceeded") for record in records
+                ),
+                "max_ms": round(durations[-1], 1),
+                "p50_ms": round(durations[len(durations) // 2], 1),
+            }
+        return summary
 
     # --- internals -----------------------------------------------------------------
 
     def _timeout_for(self, source: str) -> float:
-        if source in self._timeouts:
-            return float(self._timeouts[source])
-        spec = self._specs.get(source)
+        spec = SOURCE_SPECS.get(source)
         return float(spec["timeout_seconds"]) if spec else 30.0
 
     def _mark_failure(self, source: str, reason: str) -> None:
@@ -456,7 +454,6 @@ async def build_investigation_toolset(
     datasources: Mapping[str, str],
     evidence_store: EvidenceStore,
     budget: RequestBudget | None = None,
-    timeouts: Mapping[str, float] | None = None,
 ) -> InvestigationToolset:
     """Build the request's toolset once: every available source's tools plus inspect_evidence.
 
@@ -464,7 +461,7 @@ async def build_investigation_toolset(
     is skipped with ``source_unavailable``. The Loki datasource UID is resolved here by code,
     once, and never exposed to the agent.
     """
-    toolset = InvestigationToolset(scope=scope, evidence_store=evidence_store, budget=budget, timeouts=timeouts)
+    toolset = InvestigationToolset(scope=scope, evidence_store=evidence_store, budget=budget)
     for source in EVIDENCE_SOURCES:
         tools = source_tools.get(source)
         if not tools:
@@ -628,7 +625,7 @@ def _render_payload(body: dict[str, Any]) -> dict[str, Any]:
     return {"body": body, "text": text}
 
 
-def _payload_tokens(payload: dict[str, Any], model_name: str) -> int:
+def payload_tokens(payload: dict[str, Any], model_name: str) -> int:
     return count_tokens(payload["text"], model_name)
 
 
@@ -642,26 +639,42 @@ def fit_investigation_payload(
     """Shrink the round input until prompt + tools + input fit the context window.
 
     Authoritative inputs (query, scope, time range, gaps) are never touched; optional
-    sections lose their tail in ``_TRIM_ORDER``. If the core alone does not fit, the round
-    must not start.
+    sections lose their tail in ``_TRIM_ORDER``. Each item is priced once and the sections
+    are refilled from the one trimmed last to the one trimmed first, so the cost is one
+    token count per item rather than one per removed item. If the core alone does not
+    fit, the round must not start.
     """
     budget = max_tokens - fixed_tokens
     body = json.loads(json.dumps(payload["body"], default=str))
     current = _render_payload(body)
+    if payload_tokens(current, model_name) <= budget:
+        return current
+
+    trimmable = {key: body.pop(key) for key in _TRIM_ORDER if key in body}
+    remaining = budget - payload_tokens(_render_payload(body), model_name)
+    for key in reversed(_TRIM_ORDER):
+        kept: list[Any] = []
+        for item in trimmable.get(key, []):
+            size = count_tokens(json.dumps(item, ensure_ascii=False, default=str), model_name) + 1
+            if size > remaining:
+                break
+            kept.append(item)
+            remaining -= size
+        if kept:
+            body[key] = kept
+    # JSON tokens are not exactly additive: settle the exact count, trimming the tail of
+    # the lowest-priority section that still has items.
+    current = _render_payload(body)
     for key in _TRIM_ORDER:
-        while _payload_tokens(current, model_name) > budget and body.get(key):
-            body[key] = body[key][:-1]
+        while payload_tokens(current, model_name) > budget and body.get(key):
+            body[key].pop()
+            if not body[key]:
+                del body[key]
             current = _render_payload(body)
-        if _payload_tokens(current, model_name) > budget and key in body:
-            del body[key]
-            current = _render_payload(body)
-    tokens = _payload_tokens(current, model_name)
+    tokens = payload_tokens(current, model_name)
     if tokens > budget:
         raise RequestContextTooLargeError(tokens=tokens + fixed_tokens, max_tokens=max_tokens)
     return current
-
-
-fit_investigation_payload.tokens = _payload_tokens  # type: ignore[attr-defined]
 
 
 def investigation_fixed_tokens(toolset: InvestigationToolset, model_name: str) -> int:
@@ -680,6 +693,7 @@ __all__ = [
     "InvestigationBudgetMiddleware",
     "InvestigationToolset",
     "RequestContextTooLargeError",
+    "SourceStatus",
     "build_investigation_payload",
     "build_investigation_runner",
     "build_investigation_toolset",
@@ -687,4 +701,5 @@ __all__ = [
     "inspection_tool",
     "investigation_fixed_tokens",
     "investigation_system_prompt",
+    "payload_tokens",
 ]

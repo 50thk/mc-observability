@@ -1,13 +1,12 @@
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, TypedDict
 
 from langchain_core.language_models import BaseChatModel
 from pydantic import BaseModel, Field, model_validator
-from pydantic.json_schema import SkipJsonSchema
 
 EVIDENCE_SOURCES = ("trace", "log", "metric")
 
@@ -98,24 +97,9 @@ class ToolTraceEntry(BaseModel):
 class EvidenceRecord(BaseModel):
     evidence_id: str
     source: Literal["trace", "log", "metric"]
-    signal: str
     observation: str
     tool: str
     query: dict[str, Any] = Field(default_factory=dict)
-
-
-class EvidenceResult(BaseModel):
-    source: Literal["trace", "log", "metric"]
-    # NO_DATA is a successful observation of an empty window, not an execution problem:
-    # keeping it apart from FAILED/PARTIAL is what stops "nothing happened" from reading
-    # like "we could not look".
-    status: Literal["OK", "NO_DATA", "PARTIAL", "FAILED", "SKIPPED"]
-    summary: str = ""
-    discovered_trace_ids: list[str] = Field(default_factory=list)
-    truncated: bool = False
-    limitations: list[str] = Field(default_factory=list)
-    tool_trace: SkipJsonSchema[list[ToolTraceEntry]] = Field(default_factory=list)
-    records: SkipJsonSchema[list[EvidenceRecord]] = Field(default_factory=list)
 
 
 class EvidenceTask(BaseModel):
@@ -141,8 +125,6 @@ class RcaAnalysisState(TypedDict, total=False):
     filters: dict[str, Any]
     evidence_plan: dict[str, Any]
     merged_evidence: dict[str, Any]
-    prior_evidence_catalog: list[dict[str, Any]]
-    prior_tool_calls: list[dict[str, Any]]
     investigation_budget: dict[str, Any]
     result_validation: dict[str, Any]
     session_id: str
@@ -163,7 +145,7 @@ class RequestBudget:
     model_call_limit: int
     deadline_seconds: float | None = None
     clock: Callable[[], float] = time.perf_counter
-    started_at: float = field(default=None)  # type: ignore[assignment]
+    started_at: float | None = None
     tool_calls: int = 0
     model_calls: int = 0
 

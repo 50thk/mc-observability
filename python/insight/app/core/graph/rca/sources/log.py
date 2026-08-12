@@ -55,7 +55,6 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             return await context.invoke(logs_tool, "query_loki_logs", backend_args)
 
         return await context.run(
-            source="log",
             name="query_logs",
             args={"logql": logql, "limit": bounded},
             evidence_query=True,
@@ -72,7 +71,6 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             return await context.invoke(stats_tool, "query_loki_stats", backend_args)
 
         return await context.run(
-            source="log",
             name="query_log_volume",
             args={"logql": logql},
             evidence_query=True,
@@ -86,7 +84,6 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             return await context.invoke(label_names_tool, "list_loki_label_names", backend_args)
 
         return await context.run(
-            source="log",
             name="list_loki_label_names",
             args={},
             evidence_query=False,
@@ -103,7 +100,6 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             return await context.invoke(label_values_tool, "list_loki_label_values", backend_args)
 
         return await context.run(
-            source="log",
             name="list_loki_label_values",
             args={"label": label},
             evidence_query=False,

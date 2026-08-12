@@ -139,7 +139,6 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             return result
 
         return await context.run(
-            source="metric",
             name="query_metrics",
             args=public_args,
             evidence_query=True,
@@ -161,7 +160,6 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             return {"measurement": measurement, "tag_key": tag_key, "values": tabular_values(raw)}
 
         return await context.run(
-            source="metric",
             name="get_tag_values",
             args={"measurement": measurement, "tag_key": tag_key},
             evidence_query=False,

@@ -151,9 +151,9 @@ METRIC_CATALOG = {
 }
 
 
-def render_metric_catalog(catalog: dict = METRIC_CATALOG) -> str:
+def render_metric_catalog() -> str:
     lines = []
-    for measurement, entry in catalog.items():
+    for measurement, entry in METRIC_CATALOG.items():
         lines.append(f"- {measurement}: fields [{', '.join(entry['fields'])}]; tags [{', '.join(entry['tag_keys'])}]")
     return "\n".join(lines)
 

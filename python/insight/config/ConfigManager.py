@@ -121,7 +121,9 @@ class ConfigManager:
             "investigation_model_call_limit": rca.get("investigation_model_call_limit", 24),
             "investigation_tool_call_limit": rca.get("investigation_tool_call_limit", 10),
             "analysis_timeout_seconds": rca.get("analysis_timeout_seconds", 300),
-            "fallback_context_window_tokens": rca.get("fallback_context_window_tokens", 32768),
+            # Optimistic on purpose (matches config.yaml): an under-guess wastes a large model's
+            # capacity silently, while an over-guess surfaces as a visible provider error.
+            "fallback_context_window_tokens": rca.get("fallback_context_window_tokens", 200000),
             "tool_result_context_window_pct": rca.get("tool_result_context_window_pct", 15),
             "tool_result_absolute_max_tokens": rca.get("tool_result_absolute_max_tokens", 25000),
             "synthesis_system_prompt": rca.get("synthesis_system_prompt", ""),
