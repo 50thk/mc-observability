@@ -116,13 +116,18 @@ class ConfigManager:
         rca = self.config.get("rca_analysis", {})
         return {
             "partial_confidence_threshold": rca.get("partial_confidence_threshold", 0.4),
-            "subagent_model_call_limit": rca.get("subagent_model_call_limit", 8),
-            "subagent_tool_call_limit": rca.get("subagent_tool_call_limit", 10),
-            "subagent_tool_retry_max_retries": rca.get("subagent_tool_retry_max_retries", 2),
+            # Request-wide budgets for the central investigation agent. Provisional values —
+            # see the design's open items; tune once operational data exists.
+            "investigation_model_call_limit": rca.get("investigation_model_call_limit", 24),
+            "investigation_tool_call_limit": rca.get("investigation_tool_call_limit", 10),
+            "analysis_timeout_seconds": rca.get("analysis_timeout_seconds", 300),
             "fallback_context_window_tokens": rca.get("fallback_context_window_tokens", 32768),
             "tool_result_context_window_pct": rca.get("tool_result_context_window_pct", 15),
             "tool_result_absolute_max_tokens": rca.get("tool_result_absolute_max_tokens", 25000),
             "synthesis_system_prompt": rca.get("synthesis_system_prompt", ""),
+            "datasources": {
+                "influx_database": rca.get("datasources", {}).get("influx_database", ""),
+            },
         }
 
     def get_chat_summarization_config(self):

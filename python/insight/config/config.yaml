@@ -192,9 +192,16 @@ alarm_analysis:
 
 rca_analysis:
   partial_confidence_threshold: 0.4
-  subagent_model_call_limit: 12
-  subagent_tool_call_limit: 10
-  subagent_tool_retry_max_retries: 2
+  # Code owns the telemetry target: the platform provisions every InfluxDB with this
+  # database, so callers cannot pick another one.
+  datasources:
+    influx_database: mc-observability
+  # Central investigation agent budgets, shared by every round of one request. Provisional
+  # (잠정): 300s keeps today's effective ceiling (120s per source, in parallel, plus planning
+  # and synthesis); 24 model calls covers the 10-tool-call budget across one re-investigation.
+  investigation_model_call_limit: 24
+  investigation_tool_call_limit: 10
+  analysis_timeout_seconds: 300
   # Used only when neither the LLM connection's context_length nor the provider knows the
   # window. Optimistic on purpose: an under-guess wastes a large model's capacity silently,
   # while an over-guess is announced by a warning log naming the connection to fix.

@@ -5,7 +5,6 @@ from tempfile import TemporaryDirectory
 
 from fastapi import HTTPException, status
 from langchain_core.callbacks import get_usage_metadata_callback
-from langchain_core.language_models import BaseChatModel
 from sqlalchemy.orm import Session
 
 from app.api.llm_analysis.repo.repo import LogAnalysisRepository, RcaAnalysisRepository
@@ -22,15 +21,13 @@ from app.api.llm_analysis.response.res import (
 from app.api.llm_analysis.utils.llm_model import create_chat_model
 from app.api.llm_analysis.utils.session import CommonSessionService
 from app.core.graph.rca import (
-    CAPABILITY_SPECS,
+    SOURCE_SPECS,
     EvidenceStore,
+    IncidentScope,
     RcaRunContext,
-    SourceCollector,
-    build_collector_runner,
-)
-from app.core.graph.utils.middleware import (
-    AgentExecutionLimits,
-    create_limited_agent_middleware,
+    RequestBudget,
+    build_investigation_runner,
+    build_investigation_toolset,
 )
 from app.core.graph.utils.tool_policy import filter_tools_by_allowlist
 from config.ConfigManager import ConfigManager
@@ -121,6 +118,7 @@ def _derive_token_budgets(
         int(analysis_config.get("tool_result_absolute_max_tokens", 25_000)),
     )
     return {
+        "context_window_tokens": context_window,
         "single_tool_max_tokens": single_tool_max,
         "evidence_record_budget_tokens": int(
             context_window * _EVIDENCE_RECORD_CONTEXT_RATIO
@@ -174,6 +172,7 @@ class RcaAnalysisService:
                     session.MODEL_NAME,
                     session.CONNECTION_ID,
                     storage_dir=Path(directory),
+                    scope=resolved.scope,
                 )
                 self.db.close()
                 with get_usage_metadata_callback() as usage_callback:
@@ -286,7 +285,9 @@ class RcaAnalysisService:
         connection_id=None,
         *,
         storage_dir: Path | None = None,
+        scope: IncidentScope | None = None,
     ) -> RcaRunContext:
+        """Build everything one request shares: budget, store, toolset and the single agent."""
         llm = create_chat_model(
             self.session_repo,
             model_name,
@@ -303,73 +304,53 @@ class RcaAnalysisService:
             explicit_context_length=getattr(connection, "CONTEXT_LENGTH", None),
             model_name=model_name,
         )
-        return RcaRunContext(
-            analysis_config={
-                **self.analysis_config,
-                **token_budgets,
-                "model_name": model_name,
-            },
-            llm=llm,
-            collector_factory=self._create_collector_factory(
-                llm,
-                storage_dir=storage_dir,
-                model_name=model_name,
-                token_budgets=token_budgets,
-            ),
+        config = self.analysis_config
+        timeout_seconds = float(config["analysis_timeout_seconds"] or 0)
+        budget = RequestBudget(
+            tool_call_limit=int(config["investigation_tool_call_limit"]),
+            model_call_limit=int(config["investigation_model_call_limit"]),
+            deadline_seconds=timeout_seconds if timeout_seconds > 0 else None,
         )
-
-    def _create_collector_factory(
-        self,
-        llm: BaseChatModel,
-        *,
-        storage_dir: Path | None = None,
-        model_name: str = "gpt-4",
-        token_budgets: dict[str, int],
-    ):
-        # Budgets are always derived once in _create_rca_context, with the connection's
-        # declared context_length. Re-deriving here would silently drop that declaration.
-        collectors = {}
         evidence_store = EvidenceStore(
             storage_dir=storage_dir,
             model_name=model_name,
             single_tool_max_tokens=token_budgets["single_tool_max_tokens"],
-            record_budget_tokens=token_budgets[
-                "evidence_record_budget_tokens"
-            ],
+            record_budget_tokens=token_budgets["evidence_record_budget_tokens"],
+        )
+        toolset = await build_investigation_toolset(
+            scope=scope or IncidentScope(),
+            source_tools=self._source_tools(),
+            datasources=config.get("datasources", {}),
+            evidence_store=evidence_store,
+            budget=budget,
+        )
+        runner = (
+            build_investigation_runner(llm=llm, toolset=toolset, budget=budget)
+            if toolset.queryable_sources
+            else None
+        )
+        return RcaRunContext(
+            analysis_config={
+                **config,
+                **token_budgets,
+                "model_name": model_name,
+            },
+            llm=llm,
+            budget=budget,
+            evidence_store=evidence_store,
+            investigation_toolset=toolset,
+            investigation_runner=runner,
         )
 
-        def factory(capability: str):
-            if capability in collectors:
-                return collectors[capability]
-            spec = CAPABILITY_SPECS[capability]
-            allowed_tools = (*spec["required_tools"], *spec["optional_tools"])
-            tools = self._get_tools_for_mcp(spec["mcp"], allowed_tools)
-            tools_by_name = {
-                tool.name: tool
-                for tool in tools
-                if getattr(tool, "name", "")
-            }
-            if not set(spec["required_tools"]).issubset(tools_by_name):
-                collectors[capability] = None
-                return None
-
-            def runner_factory(query_tools):
-                return build_collector_runner(
-                    llm,
-                    query_tools,
-                    middleware=self._create_agent_middleware(self.analysis_config),
-                    instructions=spec.get("llm_instructions", ""),
-                )
-
-            collector = SourceCollector(
-                tools=tools_by_name,
-                runner_factory=runner_factory,
-                evidence_store=evidence_store,
-            )
-            collectors[capability] = collector
-            return collector
-
-        return factory
+    def _source_tools(self) -> dict[str, dict]:
+        """Raw MCP tools per source, for the sources whose required tools are all present."""
+        available = {}
+        for source, spec in SOURCE_SPECS.items():
+            tools = self._get_tools_for_mcp(spec["mcp"], (*spec["required_tools"], *spec["optional_tools"]))
+            by_name = {tool.name: tool for tool in tools if getattr(tool, "name", "")}
+            if set(spec["required_tools"]).issubset(by_name):
+                available[source] = by_name
+        return available
 
     def _get_tools_for_mcp(self, mcp_name: str, allowed_tools=()):
         """Return policy-filtered tools for one MCP server name."""
@@ -391,17 +372,6 @@ class RcaAnalysisService:
             llm_tokens,
             evidence_status,
             result_status,
-        )
-
-    @staticmethod
-    def _create_agent_middleware(analysis_config):
-        """Create model/tool/retry limits for source collectors."""
-        return create_limited_agent_middleware(
-            AgentExecutionLimits(
-                model_calls=analysis_config.get("subagent_model_call_limit", 8),
-                tool_calls=analysis_config.get("subagent_tool_call_limit", 10),
-                tool_retries=analysis_config.get("subagent_tool_retry_max_retries", 2),
-            )
         )
 
     @staticmethod

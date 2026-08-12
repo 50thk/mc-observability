@@ -4,7 +4,6 @@ const DEDICATED_FILTER_KEYS = new Set([
   'service_name',
   'endpoint',
   'status_code',
-  'database_name',
   'measurement',
   'ns_id',
   'infra_id',
@@ -24,7 +23,6 @@ export function buildRcaRequest(form = {}, context = {}) {
   if (context.nsId) attributes.ns_id = context.nsId;
   if (context.infraId) attributes.infra_id = context.infraId;
   if (context.nodeId) attributes.node_id = context.nodeId;
-  if (trimmed(form.databaseName)) attributes.database_name = trimmed(form.databaseName);
   if (trimmed(form.measurement)) attributes.measurement = trimmed(form.measurement);
 
   const scope = { attributes };

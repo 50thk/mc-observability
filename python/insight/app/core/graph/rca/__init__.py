@@ -1,5 +1,9 @@
-from .collectors import build_collector_runner, collect_evidence
 from .evidence_store import EvidenceStore
+from .investigation import (
+    InvestigationToolset,
+    build_investigation_runner,
+    build_investigation_toolset,
+)
 from .models import (
     EVIDENCE_SOURCES,
     DraftEvidencePlan,
@@ -13,16 +17,15 @@ from .models import (
     RcaHypothesis,
     RcaResult,
     RcaRunContext,
-    SourceCollector,
+    RequestBudget,
     ToolTraceEntry,
-    ValidatedSourceFilters,
 )
 from .nodes import build_rca_graph, validate_plan
-from .specs import CAPABILITY_SPECS
+from .specs import SOURCE_SPECS
 
 __all__ = [
-    "CAPABILITY_SPECS",
     "EVIDENCE_SOURCES",
+    "SOURCE_SPECS",
     "DraftEvidencePlan",
     "EvidenceRecord",
     "EvidenceResult",
@@ -30,16 +33,16 @@ __all__ = [
     "EvidenceTask",
     "IncidentScope",
     "IncidentTimeRange",
+    "InvestigationToolset",
     "RcaAnalysisState",
     "RcaEvidenceItem",
     "RcaHypothesis",
     "RcaResult",
     "RcaRunContext",
-    "SourceCollector",
+    "RequestBudget",
     "ToolTraceEntry",
-    "ValidatedSourceFilters",
-    "build_collector_runner",
+    "build_investigation_runner",
+    "build_investigation_toolset",
     "build_rca_graph",
-    "collect_evidence",
     "validate_plan",
 ]

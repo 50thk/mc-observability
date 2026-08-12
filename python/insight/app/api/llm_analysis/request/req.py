@@ -5,7 +5,12 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.core.graph.rca.models import IncidentScope, IncidentTimeRange
+from app.core.graph.rca.models import (
+    RCA_HINT_MAPS_MAX_BYTES,
+    IncidentScope,
+    IncidentTimeRange,
+    rca_hint_maps_json_bytes,
+)
 
 # Callers that name no window still expect an answer about "now". Materialising the
 # default here — rather than inside the graph — keeps the stored canonical request an
@@ -144,9 +149,13 @@ class PostRcaQueryBody(BaseModel):
     def validate_request(self):
         if self.session_id and (self.connection_id is not None or self.model_name is not None):
             raise ValueError("connection_id and model_name cannot override an existing session")
+        if "database_name" in self.scope.attributes or "database_name" in self.filters:
+            raise ValueError("database_name is configured by the server")
+        if rca_hint_maps_json_bytes(self.scope.attributes, self.filters) > RCA_HINT_MAPS_MAX_BYTES:
+            raise ValueError(f"attributes and filters must fit within {RCA_HINT_MAPS_MAX_BYTES} UTF-8 JSON bytes")
         if self.scope.time_range.start is None:
-            # A trace_id alone is not enough: every capability except traces.get is
-            # skipped as time_range_missing without a window.
+            # Every source tool is window-bound, so materialise the default even when a
+            # trace_id is already known.
             end = datetime.now(UTC)
             self.scope.time_range = IncidentTimeRange(
                 start=end - timedelta(minutes=DEFAULT_RCA_WINDOW_MINUTES),

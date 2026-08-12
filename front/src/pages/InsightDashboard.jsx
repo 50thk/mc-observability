@@ -483,7 +483,6 @@ function RcaTab({ nsId, infraId, nodeId }) {
   const [serviceName, setServiceName] = useState('');
   const [endpoint, setEndpoint] = useState('');
   const [statusCode, setStatusCode] = useState('');
-  const [databaseName, setDatabaseName] = useState('');
   const [measurement, setMeasurement] = useState('');
   const [additionalFilters, setAdditionalFilters] = useState([{ key: '', value: '' }]);
   const [llmConnections, setLlmConnections] = useState([]);
@@ -620,7 +619,7 @@ function RcaTab({ nsId, infraId, nodeId }) {
       // the API rejects a stored time_range outright.
       request = buildRcaRequest({
         query, traceId, connectionId, modelName,
-        serviceName, endpoint, statusCode, databaseName, measurement,
+        serviceName, endpoint, statusCode, measurement,
         filters: additionalFilters,
       }, { nsId, infraId, nodeId });
     } catch (e) {
@@ -674,7 +673,6 @@ function RcaTab({ nsId, infraId, nodeId }) {
         serviceName,
         endpoint,
         statusCode,
-        databaseName,
         measurement,
         filters: additionalFilters,
       }, { nsId, infraId, nodeId });
@@ -1007,7 +1005,7 @@ function RcaTab({ nsId, infraId, nodeId }) {
               </button>
               {showAdvanced && (
                 <div id="rca-advanced-scope" className="space-y-3 border-t border-slate-200 bg-slate-50/50 p-3">
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
                   <div>
                     <label htmlFor="rca-service-name" className="block text-xs text-gray-600 mb-1">Service</label>
                     <input id="rca-service-name" value={serviceName} onChange={(e) => setServiceName(e.target.value)}
@@ -1022,11 +1020,6 @@ function RcaTab({ nsId, infraId, nodeId }) {
                     <label htmlFor="rca-status-code" className="block text-xs text-gray-600 mb-1">HTTP status code</label>
                     <input id="rca-status-code" value={statusCode} onChange={(e) => setStatusCode(e.target.value)}
                       className="border rounded px-3 py-1.5 text-sm w-full" placeholder="500" />
-                  </div>
-                  <div>
-                    <label htmlFor="rca-database" className="block text-xs text-gray-600 mb-1">Database</label>
-                    <input id="rca-database" value={databaseName} onChange={(e) => setDatabaseName(e.target.value)}
-                      className="border rounded px-3 py-1.5 text-sm w-full" placeholder="mc-observability" />
                   </div>
                   <div>
                     <label htmlFor="rca-measurement" className="block text-xs text-gray-600 mb-1">Measurement</label>

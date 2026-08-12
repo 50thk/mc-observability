@@ -20,7 +20,6 @@ class _Artifact:
     reference: str
     path: Path
     source: str
-    capability: str
     tool: str
     query: dict[str, Any]
     sha256: str
@@ -29,6 +28,14 @@ class _Artifact:
 
 
 class EvidenceStore:
+    """Request-scoped evidence records and spilled raw results, keyed by source.
+
+    One store serves the whole request: the central agent's tools write into it and the
+    graph projects source status, catalog and limitations out of it. The record budget is
+    shared request-wide — there is no per-source slice, because the agent decides how many
+    calls each source gets.
+    """
+
     def __init__(
         self,
         *,
@@ -47,36 +54,26 @@ class EvidenceStore:
         self._artifacts: dict[str, _Artifact] = {}
         self._records: dict[str, EvidenceRecord] = {}
         self._used_record_tokens = 0
-        self._capability_budgets: dict[str, int] = {}
-        self._used_by_capability: dict[str, int] = {}
         self._spilled_refs: set[str] = set()
         self._discovery_refs: set[str] = set()
         self._inspected_refs: set[str] = set()
-        self._budget_exhausted_capabilities: set[str] = set()
-        self._unavailable_capabilities: set[str] = set()
+        self._admission_errors: dict[str, str] = {}
+        self._unavailable_sources: set[str] = set()
 
     def capture(
         self,
         *,
         source: str,
-        capability: str,
         tool: str,
         query: dict[str, Any],
         value: Any,
     ) -> dict[str, Any]:
         normalized, canonical = _canonical(value)
-        reference, digest = _reference(
-            source,
-            capability,
-            tool,
-            query,
-            canonical,
-        )
+        reference, digest = _reference(source, tool, query, canonical)
         record = EvidenceRecord(
             evidence_id=reference,
             source=source,
-            capability=capability,
-            signal=capability,
+            signal=tool,
             observation=canonical,
             tool=tool,
             query=dict(query),
@@ -86,16 +83,14 @@ class EvidenceStore:
             "truncated": False,
         }
         if self._fits(inline):
-            if self._admit(record):
+            if (error := self._admit(record)) is None:
                 return inline
-            self._budget_exhausted_capabilities.add(capability)
-            return self._error("evidence_budget_exhausted")
+            return self._error(error)
 
         return self._spill(
             reference=reference,
             digest=digest,
             source=source,
-            capability=capability,
             tool=tool,
             query=query,
             normalized=normalized,
@@ -107,24 +102,16 @@ class EvidenceStore:
         self,
         *,
         source: str,
-        capability: str,
         value: Any,
     ) -> Any:
         normalized, canonical = _canonical(value)
         if self._fits(normalized):
             return normalized
-        reference, digest = _reference(
-            source,
-            capability,
-            "discovery",
-            {},
-            canonical,
-        )
+        reference, digest = _reference(source, "discovery", {}, canonical)
         return self._spill(
             reference=reference,
             digest=digest,
             source=source,
-            capability=capability,
             tool="discovery",
             query={},
             normalized=normalized,
@@ -151,27 +138,27 @@ class EvidenceStore:
         try:
             artifact_path = artifact.path.resolve()
             if not artifact_path.is_relative_to(self.storage_dir):
-                self._unavailable_capabilities.add(artifact.capability)
+                self._unavailable_sources.add(artifact.source)
                 return self._error("evidence_path_invalid")
             raw = artifact_path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            self._unavailable_capabilities.add(artifact.capability)
+            self._unavailable_sources.add(artifact.source)
             return self._error("evidence_file_not_found")
         except OSError:
-            self._unavailable_capabilities.add(artifact.capability)
+            self._unavailable_sources.add(artifact.source)
             return self._error("evidence_read_failed")
 
         try:
             value = json.loads(raw)
         except json.JSONDecodeError:
-            self._unavailable_capabilities.add(artifact.capability)
+            self._unavailable_sources.add(artifact.source)
             return self._error("evidence_invalid_json")
 
         try:
             selected = _resolve_pointer(value, path)
         except (KeyError, IndexError, TypeError, ValueError):
             # A wrong pointer is a navigation mistake, not lost evidence: hand back the
-            # real paths so the next call can land instead of ending the capability.
+            # real paths so the next call can land instead of ending the source.
             return self._error("evidence_path_not_found", outline=_outline(value))
 
         _, selected_canonical = _canonical(selected)
@@ -192,7 +179,7 @@ class EvidenceStore:
         result = {**base, **view}
         if not self._fits(result):
             # Asking for too much is recoverable — the evidence is still there, so the
-            # capability must not be marked exhausted over one oversized request.
+            # source must not be marked exhausted over one oversized request.
             return self._error(
                 "inspection_response_too_large",
                 next_action="narrow_path_or_limit",
@@ -207,49 +194,30 @@ class EvidenceStore:
         record = EvidenceRecord(
             evidence_id=f"{artifact.source}:{view_digest}",
             source=artifact.source,
-            capability=artifact.capability,
-            signal=artifact.capability,
+            signal=artifact.tool,
             observation=observation,
             tool=artifact.tool,
             query=artifact.query,
         )
-        if not self._admit(record):
-            self._budget_exhausted_capabilities.add(artifact.capability)
-            return self._error("evidence_budget_exhausted")
+        if error := self._admit(record):
+            return self._error(error)
         self._inspected_refs.add(evidence_ref)
         return result
 
-    def reserve(self, capability: str, share_count: int) -> int:
-        """Give a planned capability its own slice of the record budget.
+    def records_for(self, source: str) -> list[EvidenceRecord]:
+        return [record for record in self._records.values() if record.source == source]
 
-        Capabilities in one round collect in parallel against a single store. Without
-        a per-capability slice the first collector to finish can spend the whole
-        budget, so which evidence survives depends on which MCP server answered
-        faster — the same incident then yields different analyses run to run.
-
-        An unreserved capability keeps the full budget, which is what standalone and
-        single-capability callers expect.
-        """
-        share = self.record_budget_tokens // max(share_count, 1)
-        return self._capability_budgets.setdefault(capability, share)
-
-    def records_for(self, capability: str) -> list[EvidenceRecord]:
-        return [record for record in self._records.values() if record.capability == capability]
-
-    def is_spilled(self, capability: str) -> bool:
-        return any(self._artifacts[reference].capability == capability for reference in self._spilled_refs)
-
-    def has_uninspected(self, capability: str) -> bool:
+    def has_uninspected(self, source: str) -> bool:
         return any(
-            reference not in self._inspected_refs and self._artifacts[reference].capability == capability
+            reference not in self._inspected_refs and self._artifacts[reference].source == source
             for reference in self._spilled_refs
         )
 
-    def budget_exhausted(self, capability: str) -> bool:
-        return capability in self._budget_exhausted_capabilities
+    def admission_error(self, source: str) -> str | None:
+        return self._admission_errors.get(source)
 
-    def has_unavailable(self, capability: str) -> bool:
-        return capability in self._unavailable_capabilities
+    def has_unavailable(self, source: str) -> bool:
+        return source in self._unavailable_sources
 
     def _spill(
         self,
@@ -257,7 +225,6 @@ class EvidenceStore:
         reference: str,
         digest: str,
         source: str,
-        capability: str,
         tool: str,
         query: dict[str, Any],
         normalized: Any,
@@ -266,7 +233,7 @@ class EvidenceStore:
     ) -> dict[str, Any]:
         path = (self.storage_dir / f"{digest}.json").resolve()
         if not path.is_relative_to(self.storage_dir):
-            self._unavailable_capabilities.add(capability)
+            self._unavailable_sources.add(source)
             return self._error(
                 "evidence_storage_failed",
                 inspection_required=False,
@@ -279,7 +246,6 @@ class EvidenceStore:
                     reference=reference,
                     path=path,
                     source=source,
-                    capability=capability,
                     tool=tool,
                     query=dict(query),
                     sha256=hashlib.sha256(canonical.encode()).hexdigest(),
@@ -287,7 +253,7 @@ class EvidenceStore:
                     token_count=count_tokens(canonical, self.model_name),
                 )
         except OSError:
-            self._unavailable_capabilities.add(capability)
+            self._unavailable_sources.add(source)
             return self._error(
                 "evidence_storage_failed",
                 inspection_required=False,
@@ -309,6 +275,17 @@ class EvidenceStore:
             "inspection_required": True,
             "outline": _outline(normalized),
         }
+        if recording:
+            # The result exceeded the per-call token budget: say so, say how big it is, and
+            # say what to do — the raw rows are on disk for inspect_evidence either way.
+            base.update(
+                {
+                    "truncated": True,
+                    "rows_total": _rows_total(normalized),
+                    "reason": "result_exceeds_context",
+                    "suggestion": "Narrow the query or lower limit, then retry.",
+                }
+            )
         preview = _view(
             normalized,
             "",
@@ -327,27 +304,24 @@ class EvidenceStore:
         result["outline"] = _outline(normalized, max_entries=4, max_depth=2)
         if self._fits(result):
             return result
-        # A spill result that does not fit the per-call budget is worse than no map.
-        result.pop("outline", None)
+        # A spill result that does not fit the per-call budget is worse than no map; the
+        # pointer, the size and the truncation flag are what must survive.
+        for key in ("sha256", "outline", "reason", "suggestion"):
+            result.pop(key, None)
+            if self._fits(result):
+                return result
         return result
 
-    def _admit(self, record: EvidenceRecord) -> bool:
+    def _admit(self, record: EvidenceRecord) -> str | None:
         if record.evidence_id in self._records:
-            return True
+            return None
         size = count_tokens(_serialize(record.model_dump(mode="json")), self.model_name)
         if self._used_record_tokens + size > self.record_budget_tokens:
-            return False
-        capability_used = self._used_by_capability.get(record.capability, 0)
-        capability_budget = self._capability_budgets.get(
-            record.capability,
-            self.record_budget_tokens,
-        )
-        if capability_used + size > capability_budget:
-            return False
+            self._admission_errors[record.source] = "evidence_budget_exhausted"
+            return "evidence_budget_exhausted"
         self._records[record.evidence_id] = record
         self._used_record_tokens += size
-        self._used_by_capability[record.capability] = capability_used + size
-        return True
+        return None
 
     def _fits(self, value: Any) -> bool:
         return count_tokens(_serialize(value), self.model_name) <= self.single_tool_max_tokens
@@ -374,7 +348,6 @@ def _serialize(value: Any) -> str:
 
 def _reference(
     source: str,
-    capability: str,
     tool: str,
     query: dict[str, Any],
     canonical: str,
@@ -382,13 +355,25 @@ def _reference(
     metadata = _serialize(
         {
             "source": source,
-            "capability": capability,
             "tool": tool,
             "query": query,
         }
     )
     digest = hashlib.sha256(f"{metadata}\0{canonical}".encode()).hexdigest()
     return f"{source}:{digest[:16]}", digest
+
+
+def _rows_total(value: Any) -> int:
+    """How many rows a payload carries: the length of its first list, else one."""
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        for item in value.values():
+            if isinstance(item, list):
+                return len(item)
+            if isinstance(item, dict):
+                return _rows_total(item)
+    return 1
 
 
 def _kind(value: Any) -> str:
@@ -414,7 +399,7 @@ def _outline(value: Any, *, max_entries: int = 12, max_depth: int = 4) -> list[d
 
     A preview of the first few elements does not tell an agent where anything lives,
     so it has to guess pointers into a structure it has never seen — and one wrong
-    guess used to end the capability. This lists what is actually there.
+    guess used to end the source. This lists what is actually there.
     """
     entries: list[dict[str, Any]] = []
     queue: list[tuple[str, Any, int]] = [("", value, 0)]

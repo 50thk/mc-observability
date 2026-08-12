@@ -1,13 +1,24 @@
-import operator
-from dataclasses import dataclass
+import json
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from langchain_core.language_models import BaseChatModel
 from pydantic import BaseModel, Field, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 EVIDENCE_SOURCES = ("trace", "log", "metric")
+
+# Upper bound on the caller-supplied hint maps (scope.attributes + filters) as UTF-8 JSON.
+# They are prompt input for the investigation agent, not query text, so a generous fixed
+# size keeps one request from crowding out its own evidence.
+RCA_HINT_MAPS_MAX_BYTES = 16_384
+
+
+def rca_hint_maps_json_bytes(*values: dict[str, Any]) -> int:
+    return len(json.dumps(values, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
 
 
 class RcaEvidenceItem(BaseModel):
@@ -87,7 +98,6 @@ class ToolTraceEntry(BaseModel):
 class EvidenceRecord(BaseModel):
     evidence_id: str
     source: Literal["trace", "log", "metric"]
-    capability: str
     signal: str
     observation: str
     tool: str
@@ -96,7 +106,6 @@ class EvidenceRecord(BaseModel):
 
 class EvidenceResult(BaseModel):
     source: Literal["trace", "log", "metric"]
-    capability: str = ""
     # NO_DATA is a successful observation of an empty window, not an execution problem:
     # keeping it apart from FAILED/PARTIAL is what stops "nothing happened" from reading
     # like "we could not look".
@@ -109,19 +118,11 @@ class EvidenceResult(BaseModel):
     records: SkipJsonSchema[list[EvidenceRecord]] = Field(default_factory=list)
 
 
-class ValidatedSourceFilters(BaseModel):
-    source: Literal["trace", "log", "metric"]
-    verified_filters: dict[str, Any] = Field(default_factory=dict)
-    ignored_filters: dict[str, str] = Field(default_factory=dict)
-    discovery: dict[str, Any] = Field(default_factory=dict)
-
-
 class EvidenceTask(BaseModel):
-    capability: str
+    """A planner hint for the central agent: which source to look at, and for what."""
+
+    source: str
     focus: str = ""
-    # Set by the planner's validator, not by the model: "broad" means the request named no
-    # target for this source, so the collector discovers one instead of skipping.
-    breadth: SkipJsonSchema[Literal["scoped", "broad"]] = "scoped"
 
 
 class DraftEvidencePlan(BaseModel):
@@ -132,17 +133,17 @@ class DraftEvidencePlan(BaseModel):
 
 class RcaAnalysisState(TypedDict, total=False):
     query: str | None
-    available_capabilities: list[str]
+    available_sources: list[str]
     hypotheses: list[str]
     evidence_gaps: list[str]
     investigation_round: int
     scope: dict[str, Any]
     filters: dict[str, Any]
-    task: dict[str, Any]
-    plan_size: int
     evidence_plan: dict[str, Any]
-    evidence: Annotated[list[dict[str, Any]], operator.add]
     merged_evidence: dict[str, Any]
+    prior_evidence_catalog: list[dict[str, Any]]
+    prior_tool_calls: list[dict[str, Any]]
+    investigation_budget: dict[str, Any]
     result_validation: dict[str, Any]
     session_id: str
     analysis_result: dict | None
@@ -150,14 +151,67 @@ class RcaAnalysisState(TypedDict, total=False):
 
 
 @dataclass(slots=True)
-class RcaRunContext:
-    analysis_config: dict[str, Any]
-    llm: BaseChatModel | None = None
-    collector_factory: Any = None
+class RequestBudget:
+    """Request-wide limits shared by every investigation round and every tool.
+
+    langchain's ModelCallLimit/ToolCallLimit middleware count per ``invoke``; the central
+    agent is invoked once per round, so a re-investigation would reset them. These counters
+    belong to the request, and the deadline clamps every tool timeout.
+    """
+
+    tool_call_limit: int
+    model_call_limit: int
+    deadline_seconds: float | None = None
+    clock: Callable[[], float] = time.perf_counter
+    started_at: float = field(default=None)  # type: ignore[assignment]
+    tool_calls: int = 0
+    model_calls: int = 0
+
+    def __post_init__(self) -> None:
+        if self.started_at is None:
+            self.started_at = self.clock()
+
+    def reserve_tool_call(self) -> bool:
+        if self.tool_calls >= self.tool_call_limit:
+            return False
+        self.tool_calls += 1
+        return True
+
+    def reserve_model_call(self) -> bool:
+        if self.model_calls >= self.model_call_limit:
+            return False
+        self.model_calls += 1
+        return True
+
+    @property
+    def remaining_tool_calls(self) -> int:
+        return max(self.tool_call_limit - self.tool_calls, 0)
+
+    @property
+    def remaining_model_calls(self) -> int:
+        return max(self.model_call_limit - self.model_calls, 0)
+
+    def remaining_seconds(self) -> float | None:
+        if self.deadline_seconds is None:
+            return None
+        return max(self.started_at + self.deadline_seconds - self.clock(), 0.0)
+
+    @property
+    def expired(self) -> bool:
+        remaining = self.remaining_seconds()
+        return remaining is not None and remaining <= 0
+
+    def clamp_timeout(self, timeout_seconds: float) -> float:
+        remaining = self.remaining_seconds()
+        return timeout_seconds if remaining is None else min(timeout_seconds, remaining)
 
 
 @dataclass(slots=True)
-class SourceCollector:
-    tools: dict[str, Any]
-    runner_factory: Any = None
+class RcaRunContext:
+    analysis_config: dict[str, Any]
+    llm: BaseChatModel | None = None
+    budget: RequestBudget | None = None
+    # Built once per request and reused by every investigation round.
     evidence_store: Any = None
+    investigation_toolset: Any = None
+    investigation_runner: Any = None
