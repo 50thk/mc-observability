@@ -159,40 +159,75 @@ def render_metric_catalog() -> str:
 
 
 _LOG_SOURCE_INSTRUCTIONS = """
-Log source (Loki). Answers: what the service logged in the incident window and how much.
-The Loki datasource and the time window are fixed by code; every log tool already runs
-inside them. Write selection-only LogQL: a stream selector {label="value", ...} followed by
-optional line filters (|=, !=, |~, !~). Parsers, formatters, aggregations, ranges and
-offsets are rejected. `component` is the service label emitted by this platform's log
-pipeline. Discover label names or values only when you do not know them. Start broad, then
-narrow once with literals you saw in earlier output. An empty result is data: relax one
-constraint once, then report what you searched for. Never infer a cause from absent logs.
+Log source (Loki).
+Answers: what each service logged in the window, which lines describe the failure, and the
+identifiers to follow into other sources (traceID=..., request ids, error classes, hosts).
+The datasource and the time window are fixed by code; every log tool already runs inside them.
+The service of a line is its `component` label; `severity_text` is the level.
+Workflow: 1) One selector for every service you care about: {component=~"payment-api|checkout"},
+   optionally with severity_text=~"ERROR|WARN". 2) Narrow with a line filter built from literals
+   you actually saw: |= "timeout", |~ "(?i)pool exhausted|connection reset". 3) Follow a traceID=
+   you find into get_trace. Discover label names or values only when you do not know them.
+Patterns: {component="payment-api", severity_text="ERROR"} ; {component=~"a|b"} |~ "5\\d\\d|timeout" ;
+   {system="mc-observability"} |= "OutOfMemory"
+Empty result: relax one constraint once (drop the line filter, then widen the selector), then
+   move on. Absence of logs is a finding, never a cause.
+query_log_volume takes a bare selector and counts flushed chunks only, so it can read zero for
+   very recent logs: use it to compare volumes, and query_logs to establish that logs exist.
+Do not: one call per service; parsers, formatters, aggregations, ranges or offsets (rejected);
+   guess label names; put time in the query.
 """
 
 _TRACE_SOURCE_INSTRUCTIONS = """
-Trace source (Tempo). Answers: which requests failed or were slow, and where one request
-spent its time. The time window is fixed by code. Write a single selection-only TraceQL
-spanset filter { ... } combining comparisons with && and ||; pipelines, aggregates and
-structural operators between spansets are rejected. Search the window when no trace_id is
-known; when a log line or a search exposes a trace_id, open it with get_trace and read the
-span table (error spans first, then the slowest). Setting both an error and a duration
-constraint usually returns nothing — prefer one. Relax one constraint after an empty search;
-then report NO_DATA rather than concluding that nothing failed.
+Trace source (Tempo).
+Answers: which requests failed or were slow, on which node and route, and where one request
+spent its time. Spans come from the platform's collectors (Beyla, otel-java): resource.service.name
+is the collector's identity (one value per site, e.g. cmp-beyla-<site>), so the node of a span is
+resource.host.name (or resource.node_id) and the request is span.http.route / span.url.path.
+Scope fields: status_code -> span.http.response.status_code, endpoint -> span.http.route,
+   node_id -> resource.host.name; service_name has no trace field — match it through the route or
+   a trace_id found in the logs. The time window is fixed by code.
+Workflow: 1) search_traces with ONE spanset: { resource.host.name = "node-payment-1" && status = error }.
+   The result already lists the matched spans (host, name, duration, status, attributes): read
+   them before opening anything. 2) get_trace only for ONE representative trace when you need the
+   full span tree — a trace_id from a log line or from the search. 3) list_trace_attribute_values
+   ("resource.host.name") only when you do not know the node names.
+Patterns: { kind = server && span.http.response.status_code >= 500 } ;
+   { span.http.route = "/pay" && duration > 2s } ;
+   { resource.host.name = "node-inventory-1" && duration > 1s && status != error } ;
+   { span.db.system = "postgresql" && status = error }
+Scope rule: span attributes are span.x (span.db.system, span.http.response.status_code), resource
+   attributes are resource.x (resource.host.name); bare names are intrinsics only (status,
+   duration, name, kind, rootServiceName). Unscoped "db.system" is rejected.
+Empty result: drop the strictest comparison first (status before duration before route), then
+   move on. Do not set an error status and a duration bound together on a first search.
+Do not: open every trace from a search; pipelines, aggregates or structural operators (rejected);
+   put time in the query; treat resource.service.name as an application name.
 """
 
 _METRIC_SOURCE_INSTRUCTIONS = (
     """
-Metric source (InfluxDB, Telegraf). Answers: whether an infrastructure signal moved during
-the window, optionally compared with the immediately preceding baseline. The database and
-time window are fixed by code. Measurements, fields and tag keys are fixed too — pick them
-verbatim from this catalog:
+Metric source (InfluxDB, Telegraf).
+Answers: whether an infrastructure signal moved on a node during the window, and how it compares
+with the equal-length window just before it. The node of a series is its node_id tag. The database and
+time window are fixed by code.
+Catalog (fixed — pick names verbatim; the plugin may be off on a given node, which reads as NO_DATA):
 """
     + render_metric_catalog()
     + """
-Tag values (node_id, device, interface, pid, ...) vary per node: take them from the scope
-when given, otherwise discover them with get_tag_values. Choose max for spikes and
-saturation, mean for sustained load, last for the final state. A measurement listed here
-may still have no rows for a node whose plugin is off: that is NO_DATA, not an error.
+Workflow: 1) Take node_id from the scope, or from a trace/log (host.name, node=...). 2) ONE call
+   for the node's picture: {"measurements": ["cpu","mem","system","disk","net"], "fields": ["*"],
+   "aggregation": "max", "tag_filters": {"node_id": "..."}, "compare_baseline": true}. 3) Narrow to
+   the one signal that moved to see its shape: {"measurements": ["cpu"], "fields": ["usage_idle"],
+   "aggregation": "min", "tag_filters": {...}, "group_by": ["1m"]}.
+Patterns: max for spikes and saturation, mean for sustained load, last for the final state, count
+   to see whether the node reported at all. group_by ["1m"] shows the shape; omit it for one number
+   per window. Tag values (node_id, device, interface, pid) vary per node: get_tag_values only when
+   the scope does not name them.
+Empty result: the plugin is off on that node or the node_id is wrong — check
+   get_tag_values("cpu", "node_id") once, then move on.
+Do not: one call per measurement; query nodes the incident does not involve; repeat a query with
+   the same arguments; treat a missing measurement on one node as an error.
 """
 )
 

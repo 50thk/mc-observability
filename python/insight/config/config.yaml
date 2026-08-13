@@ -198,9 +198,11 @@ rca_analysis:
     influx_database: mc-observability
   # Central investigation agent budgets, shared by every round of one request. Provisional
   # (잠정): 300s keeps today's effective ceiling (120s per source, in parallel, plus planning
-  # and synthesis); 24 model calls covers the 10-tool-call budget across one re-investigation.
+  # and synthesis). e2e with gpt-5.6 showed the agent fans out ~9 independent calls in its
+  # first turn, so 10 tool calls left no room for follow-ups; 24 covers two such turns plus
+  # a re-investigation.
   investigation_model_call_limit: 24
-  investigation_tool_call_limit: 10
+  investigation_tool_call_limit: 24
   analysis_timeout_seconds: 300
   # Used only when neither the LLM connection's context_length nor the provider knows the
   # window. Optimistic on purpose: an under-guess wastes a large model's capacity silently,

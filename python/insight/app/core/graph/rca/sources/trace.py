@@ -27,17 +27,29 @@ _ATTRIBUTE = re.compile(r"\.?[A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*
 
 # OTLP attribute values are single-key wrappers; these are the ones worth keeping.
 _OTLP_VALUE_KEYS = ("stringValue", "intValue", "doubleValue", "boolValue")
+# Stable OTel semconv first (what Beyla 3.x and otel-java 2.x emit), then the pre-stable
+# names the platform's own services still use.
 _SPAN_ATTRIBUTE_KEYS = (
-    "http.method",
+    "http.request.method",
     "http.route",
-    "http.target",
-    "http.status_code",
+    "url.path",
+    "url.full",
+    "http.response.status_code",
+    "server.address",
+    "server.port",
     "db.system",
-    "db.statement",
+    "db.namespace",
+    "db.operation.name",
+    "db.query.text",
     "rpc.method",
-    "error",
+    "rpc.grpc.status_code",
     "exception.type",
     "exception.message",
+    "http.method",
+    "http.target",
+    "http.status_code",
+    "db.statement",
+    "error",
 )
 
 
@@ -109,9 +121,14 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             coroutine=search_traces,
             name="search_traces",
             description=(
-                "Search traces in the incident window with a single selection-only TraceQL spanset such as "
-                '{ resource.service.name = "checkout" && status = error }. Pipelines and aggregates are '
-                f"rejected. limit defaults to {_SPEC['default_limit']} and is capped at {_SPEC['max_limit']}."
+                "Search traces in the incident window with ONE selection-only TraceQL spanset; the result lists "
+                "the matched spans, so read it before opening a trace. Scope attributes: span.x for span "
+                "attributes, resource.x for resource attributes, bare names only for intrinsics (status, "
+                'duration, name, kind). Examples: { resource.host.name = "node-payment-1" && status = error } ; '
+                '{ span.http.route = "/pay" && duration > 2s } ; { kind = server && span.http.response.status_code >= 500 }. '
+                "Pipelines and "
+                f"aggregates are rejected. limit: default {_SPEC['default_limit']}, max {_SPEC['max_limit']} — "
+                "raise it only when the first page was not enough."
             ),
         ),
         StructuredTool.from_function(
@@ -158,11 +175,13 @@ def summarize_trace(raw: Any, trace_id: str) -> Any:
             sorted((span for span in spans if not span["error"]), key=lambda span: -span["duration_ms"])[:remaining]
         )
     services = sorted({span["service"] for span in spans if span["service"]})
+    hosts = sorted({span["host"] for span in spans if span["host"]})
     return {
         "trace_id": trace_id,
         "span_count": len(spans),
         "error_span_count": len(errors),
         "services": services,
+        "hosts": hosts,
         "total_duration_ms": max((span["duration_ms"] for span in spans), default=0.0),
         "truncated_spans": max(len(spans) - len(selected), 0),
         "spans": selected,
@@ -190,6 +209,8 @@ def _otlp_spans(raw: Any) -> list[dict[str, Any]]:
                 rows.append(
                     {
                         "service": str(resource.get("service.name") or ""),
+                        # Beyla's service.name is one value per site; the node is the identity that matters.
+                        "host": str(resource.get("host.name") or resource.get("node_id") or ""),
                         "name": str(span.get("name") or ""),
                         "span_id": str(span.get("spanId") or ""),
                         "parent_span_id": str(span.get("parentSpanId") or ""),
@@ -215,6 +236,12 @@ def _otlp_attributes(items: Any) -> dict[str, Any]:
         for value_key in _OTLP_VALUE_KEYS:
             if value_key in value:
                 found = value[value_key]
+                if value_key == "intValue":
+                    # OTLP/JSON carries int64 as a decimal string; status codes must compare as numbers.
+                    try:
+                        found = int(found)
+                    except (TypeError, ValueError):
+                        pass
                 values[key] = found[:200] if isinstance(found, str) else found
                 break
     return values

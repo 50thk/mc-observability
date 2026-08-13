@@ -160,7 +160,11 @@ class RcaGraphNodes:
             "Set conclusion_strength to CONFIRMED only when raw evidence records from two different sources "
             "support the causal claim without contradiction; use LIKELY for one grounded causal path and "
             "INCONCLUSIVE when evidence is sparse, indirect, or conflicting. For an INCONCLUSIVE result, "
-            "put only concrete, collectable evidence gaps in next_checks."
+            "put only concrete, collectable evidence gaps in next_checks.\n"
+            "probable_cause explains the requested scope only; leave it empty when that scope shows no failure "
+            "or when the requested name itself has no data (a near match is a related finding, not the scope). "
+            "The summary's first sentence states what was observed for the requested scope, naming it verbatim; "
+            "other services follow as related findings labelled with their own name."
         )
         last_error = "synthesis failed"
         for _ in range(2):
@@ -507,7 +511,9 @@ def _ground_result_references(
     if result.get("probable_cause") and grounded_hypotheses:
         result["probable_cause"] = grounded_hypotheses[0]["cause"]
     supporting = [item for item in result["evidence"] if item.get("supports_cause")]
-    contradiction_count = sum(len(hypothesis["contradicting_evidence"]) for hypothesis in grounded_hypotheses)
+    # Only contradictions against the canonical (first) hypothesis weaken the conclusion;
+    # evidence that refutes a rejected alternative is what ruling it out looks like.
+    contradiction_count = len(grounded_hypotheses[0]["contradicting_evidence"]) if grounded_hypotheses else 0
     return result, supporting, contradiction_count
 
 

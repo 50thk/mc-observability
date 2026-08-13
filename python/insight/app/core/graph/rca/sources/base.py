@@ -144,6 +144,10 @@ def is_empty_payload(value: Any) -> bool:
         return False
     if isinstance(results := value.get("results"), list):
         return not any(isinstance(item, dict) and item.get("series") for item in results)
+    # A counters-only payload of zeros (Loki index stats: bytes/chunks/entries/streams) has
+    # no rows behind it.
+    if value and all(isinstance(item, (int, float)) and not isinstance(item, bool) and item == 0 for item in value.values()):
+        return True
     present = [key for key in _CONTAINER_KEYS if key in value]
     if present:
         return all(is_empty_payload(value[key]) for key in present)

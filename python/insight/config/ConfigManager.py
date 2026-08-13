@@ -119,7 +119,7 @@ class ConfigManager:
             # Request-wide budgets for the central investigation agent. Provisional values —
             # see the design's open items; tune once operational data exists.
             "investigation_model_call_limit": rca.get("investigation_model_call_limit", 24),
-            "investigation_tool_call_limit": rca.get("investigation_tool_call_limit", 10),
+            "investigation_tool_call_limit": rca.get("investigation_tool_call_limit", 24),
             "analysis_timeout_seconds": rca.get("analysis_timeout_seconds", 300),
             # Optimistic on purpose (matches config.yaml): an under-guess wastes a large model's
             # capacity silently, while an over-guess surfaces as a visible provider error.

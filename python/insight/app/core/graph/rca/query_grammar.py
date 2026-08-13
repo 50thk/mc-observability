@@ -25,13 +25,35 @@ _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h)?")
 _LOGQL_MATCHER_OPS = ("=~", "!~", "!=", "=")
 _LOGQL_FILTER_OPS = ("|=", "!=", "|~", "!~")
 _TRACEQL_OPS = ("=~", "!~", "!=", ">=", "<=", "=", ">", "<")
+# Bare identifiers Tempo understands without a scope (TraceQL intrinsics, verified against
+# Tempo 2.9.2's /api/search); anything else must be scoped. Scoped intrinsics such as span:id,
+# trace:rootName, event:name, link:traceID and instrumentation:name pass by prefix below.
+_TRACEQL_INTRINSICS = {
+    "status",
+    "statusMessage",
+    "duration",
+    "name",
+    "kind",
+    "rootName",
+    "rootServiceName",
+    "traceDuration",
+    "nestedSetLeft",
+    "nestedSetRight",
+    "nestedSetParent",
+}
+_TRACEQL_SCOPES = ("span.", "resource.", "event.", "link.", "instrumentation.", "parent.", ".")
+_TRACEQL_SCOPED_INTRINSICS = ("span:", "trace:", "event:", "link:", "instrumentation:", "parent:")
 
 _LOGQL_SHAPE = 'LogQL must be a stream selector {label="value", ...} followed only by line filters (|=, !=, |~, !~)'
 _TRACEQL_SHAPE = "TraceQL must be a single spanset filter { ... } of comparisons joined by && or ||"
 
 
-def validate_logql(query: str) -> str | None:
-    """Return None when ``query`` is selection-only LogQL, else the reason it is not."""
+def validate_logql(query: str, *, allow_line_filters: bool = True) -> str | None:
+    """Return None when ``query`` is selection-only LogQL, else the reason it is not.
+
+    ``allow_line_filters=False`` restricts the query to the bare stream selector, which is
+    all Loki's index-stats API accepts.
+    """
     text = query.strip()
     if not text:
         return f"empty query; {_LOGQL_SHAPE}"
@@ -46,6 +68,8 @@ def validate_logql(query: str) -> str | None:
         pos = _skip(text, pos)
         if pos == len(text):
             return None
+        if not allow_line_filters:
+            return "this query takes a stream selector only ({label=\"value\", ...}); drop the line filters"
         op = _take(text, pos, _LOGQL_FILTER_OPS)
         if op is None:
             return f"{_LOGQL_SHAPE}; found {text[pos:pos + 12]!r} after the selector"
@@ -142,6 +166,12 @@ def _parse_trace_term(text: str, pos: int) -> tuple[int, str | None]:
         return pos, f"functions and aggregates such as {field}() are not allowed inside the spanset"
     if field in ("true", "false"):
         return pos, None
+    if not _traceql_field_is_scoped(field):
+        return pos, (
+            f"attribute {field!r} needs a scope: span.{field} for span attributes, resource.{field} for "
+            "resource attributes (or a leading dot to search both); only intrinsics such as status, "
+            "duration, name and kind are bare"
+        )
     op = _take(text, pos, _TRACEQL_OPS)
     if op is None:
         return pos, f"expected a comparison operator after {field!r}"
@@ -162,6 +192,10 @@ def _parse_trace_value(text: str, pos: int) -> tuple[int, str | None]:
             return pos, f"functions and aggregates such as {match.group()}() are not allowed inside the spanset"
         return match.end(), None
     return pos, f"expected a value near {text[pos:pos + 12]!r}"
+
+
+def _traceql_field_is_scoped(field: str) -> bool:
+    return field in _TRACEQL_INTRINSICS or field.startswith(_TRACEQL_SCOPES) or field.startswith(_TRACEQL_SCOPED_INTRINSICS)
 
 
 # --- shared --------------------------------------------------------------------------

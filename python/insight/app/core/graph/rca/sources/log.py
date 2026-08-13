@@ -35,10 +35,10 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
     start, end = incident_window(context.scope)
     window = {"startRfc3339": start, "endRfc3339": end}
 
-    def _check_query(logql: str) -> dict[str, Any] | None:
+    def _check_query(logql: str, *, allow_line_filters: bool = True) -> dict[str, Any] | None:
         if len(logql) > _MAX_QUERY_CHARS:
             return rejected("query_too_long", max_chars=_MAX_QUERY_CHARS)
-        if reason := validate_logql(logql):
+        if reason := validate_logql(logql, allow_line_filters=allow_line_filters):
             return rejected("query_not_allowed", reason=reason)
         return None
 
@@ -63,7 +63,7 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
 
     async def query_log_volume(logql: str) -> Any:
         logql = logql.strip()
-        if error := _check_query(logql):
+        if error := _check_query(logql, allow_line_filters=False):
             return error
         backend_args = {"datasourceUid": datasource_uid, "logql": logql, **window}
 
@@ -112,17 +112,20 @@ def build_tools(context: SourceContext) -> list[StructuredTool]:
             name="query_logs",
             description=(
                 "Fetch log lines for a selection-only LogQL query: a stream selector {label=\"value\"} "
-                "followed by optional line filters (|=, !=, |~, !~). The datasource and the incident "
-                f"time window are fixed by code. limit defaults to {_SPEC['default_limit']} and is capped at "
-                f"{_SPEC['max_limit']}."
+                "followed by optional line filters (|=, !=, |~, !~). Cover several services in one call with "
+                'a regex matcher. Examples: {component=~"payment-api|checkout", severity_text="ERROR"} ; '
+                '{component="payment-api"} |~ "(?i)timeout|pool exhausted". The datasource and the incident '
+                f"time window are fixed by code. limit: default {_SPEC['default_limit']}, max "
+                f"{_SPEC['max_limit']} — raise it only when a result was truncated."
             ),
         ),
         StructuredTool.from_function(
             coroutine=query_log_volume,
             name="query_log_volume",
             description=(
-                "Measure how many log bytes/lines a selection-only LogQL selector produced in the incident "
-                "window. A zero count is a real measurement."
+                "Measure how many log bytes/lines a stream selector {label=\"value\"} produced in the incident "
+                "window (selector only, no line filters). Counts cover flushed chunks, so very recent logs may "
+                "read as zero; confirm presence with query_logs."
             ),
         ),
         StructuredTool.from_function(
