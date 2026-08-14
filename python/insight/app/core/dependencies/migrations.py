@@ -42,6 +42,12 @@ def _ensure_rca_schedule_schema(conn) -> None:
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
         )
     )
+    _ensure_column(
+        conn,
+        "mc_o11y_insight_rca_schedule",
+        "TRIGGER_TYPE",
+        "`TRIGGER_TYPE` VARCHAR(32) NULL DEFAULT NULL AFTER `INTERVAL_MINUTES`",
+    )
 
 
 def _ensure_llm_connection_schema(conn) -> None:

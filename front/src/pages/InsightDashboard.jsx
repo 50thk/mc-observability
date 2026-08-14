@@ -493,6 +493,9 @@ function RcaTab({ nsId, infraId, nodeId }) {
   const [scheduleName, setScheduleName] = useState('');
   const [scheduleInterval, setScheduleInterval] = useState(15);
   const [scheduleBusyId, setScheduleBusyId] = useState(null);
+  const [showWatchForm, setShowWatchForm] = useState(false);
+  const [watchName, setWatchName] = useState('');
+  const [watchInterval, setWatchInterval] = useState(15);
   const [deletingId, setDeletingId] = useState(null);
   const [defaultingId, setDefaultingId] = useState(null);
   const [editingId, setEditingId] = useState(null);
@@ -640,6 +643,32 @@ function RcaTab({ nsId, infraId, nodeId }) {
       setMsg(`Schedule "${scheduleName.trim()}" saved. It runs every ${scheduleInterval} minutes.`);
     } catch (e) {
       setMsg('Saving the schedule failed: ' + apiError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // A server error watch is a schedule with trigger="server_error": the worker searches
+  // Tempo for HTTP 5xx server spans in each interval and analyses only when it finds some.
+  // No question, time or status code to fill in — the watch defines them.
+  async function handleSaveWatch() {
+    const request = buildRcaRequest({ connectionId, modelName }, { nsId, infraId, nodeId });
+    setBusy(true);
+    setMsg('');
+    try {
+      await createRcaSchedule({
+        name: watchName.trim(),
+        enabled: true,
+        interval_minutes: Number(watchInterval),
+        trigger: 'server_error',
+        request,
+      });
+      setWatchName('');
+      setShowWatchForm(false);
+      await loadSchedules();
+      setMsg(`Watch "${watchName.trim()}" saved. Every ${watchInterval} minutes it checks for server errors and analyses them when found.`);
+    } catch (e) {
+      setMsg('Saving the watch failed: ' + apiError(e));
     } finally {
       setBusy(false);
     }
@@ -805,16 +834,84 @@ function RcaTab({ nsId, infraId, nodeId }) {
           <span className="text-xs text-gray-400">
             Saved requests re-run on their interval. Results appear in the analyses list below.
           </span>
+          <button type="button" onClick={() => setShowWatchForm((current) => !current)}
+            aria-expanded={showWatchForm}
+            className="ml-auto rounded-md border border-purple-600 px-3 py-1.5 text-xs font-semibold text-purple-700 hover:bg-purple-50">
+            {showWatchForm ? 'Close' : '+ Watch for server errors'}
+          </button>
         </div>
+        {showWatchForm && (
+          <div className="border-b bg-slate-50/50 px-4 py-3 space-y-3">
+            <div>
+              <p className="text-sm font-medium text-slate-800">Watch for server errors</p>
+              <p className="text-xs text-slate-500">
+                Every N minutes, check for HTTP 5xx server errors and run a root-cause analysis
+                automatically when any are found. Nothing runs when there are none.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <label className="text-xs text-gray-600">
+                Name
+                <input value={watchName} onChange={(e) => setWatchName(e.target.value)} maxLength={100}
+                  placeholder="payment 5xx" className="mt-1 block border rounded px-3 py-1.5 text-sm text-gray-700 w-full" />
+              </label>
+              <label className="text-xs text-gray-600">
+                Every (min)
+                <input type="number" min={5} max={10080} value={watchInterval}
+                  onChange={(e) => setWatchInterval(e.target.value)}
+                  className="mt-1 block border rounded px-3 py-1.5 text-sm text-gray-700 w-full" />
+              </label>
+              <label className="text-xs text-gray-600">
+                Connection
+                <select value={connectionId} disabled={enabledConnections.length === 0}
+                  onChange={(e) => {
+                    const nextId = e.target.value;
+                    const connection = enabledConnections.find((item) => String(item.id) === nextId);
+                    setConnectionId(nextId);
+                    setConnectionModels(connection?.default_model ? [connection.default_model] : []);
+                    setModelName(connection?.default_model || '');
+                  }}
+                  className="mt-1 block border rounded px-2 py-1.5 text-sm w-full disabled:bg-gray-100">
+                  {enabledConnections.length === 0 && <option value="">No enabled connection</option>}
+                  {enabledConnections.map((connection) => (
+                    <option key={connection.id} value={connection.id}>{connection.name} ({connection.provider})</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-xs text-gray-600">
+                Model
+                <select value={modelName} disabled={connectionModels.length === 0}
+                  onChange={(e) => setModelName(e.target.value)}
+                  className="mt-1 block border rounded px-2 py-1.5 text-sm w-full disabled:bg-gray-100">
+                  {connectionModels.length === 0 && <option value="">No model</option>}
+                  {connectionModels.map((mn) => <option key={mn} value={mn}>{mn}</option>)}
+                </select>
+              </label>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-slate-500">Scope</span>
+              {nsId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">NS {nsId}</span>}
+              {infraId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">Infra {infraId}</span>}
+              {nodeId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">Node {nodeId}</span>}
+              {!nsId && !infraId && !nodeId && <span className="text-xs text-slate-400">all namespaces</span>}
+              <button type="button" onClick={handleSaveWatch}
+                disabled={busy || !watchName.trim() || !connectionId || !modelName}
+                className="ml-auto rounded-md bg-purple-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-purple-700 disabled:cursor-not-allowed disabled:opacity-50">
+                Save
+              </button>
+            </div>
+          </div>
+        )}
         <div className="p-4 overflow-auto">
           {schedules.length === 0 ? (
             <p className="text-sm text-gray-400">
-              No schedules yet — open “+ New Analysis” below, fill it in, name it, and choose “Save as schedule”.
+              No schedules yet — “+ Watch for server errors” analyses 5xx errors as they happen; “Save as schedule”
+              under “+ New Analysis” repeats a question on an interval.
             </p>
           ) : (
             <table className="w-full text-sm">
               <thead><tr className="bg-gray-50 text-left">
-                {['Name', 'Every', 'Enabled', 'Last status', 'Last run', 'Next run', 'Analysis'].map((label) => (
+                {['Name', 'Every', 'Trigger', 'Enabled', 'Last status', 'Last run', 'Next run', 'Analysis'].map((label) => (
                   <th key={label} className="px-3 py-2 border-b text-xs text-gray-500">{label}</th>
                 ))}
                 <th className="px-3 py-2 border-b text-xs text-gray-500 text-right">Actions</th>
@@ -827,17 +924,23 @@ function RcaTab({ nsId, infraId, nodeId }) {
                     <tr key={schedule.id} className="hover:bg-gray-50">
                       <td className="px-3 py-2 border-b font-medium break-words">{schedule.name}</td>
                       <td className="px-3 py-2 border-b">{schedule.interval_minutes}m</td>
+                      <td className="px-3 py-2 border-b text-xs text-gray-600">
+                        {schedule.trigger === 'server_error' ? 'Server error' : '-'}
+                      </td>
                       <td className="px-3 py-2 border-b">
                         <span className={`text-xs px-2 py-0.5 rounded-full ${schedule.enabled ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
                           {schedule.enabled ? 'On' : 'Off'}
                         </span>
                       </td>
-                      <td className="px-3 py-2 border-b"><SeBadge status={schedule.status} /></td>
+                      <td className="px-3 py-2 border-b">
+                        {/* A watch that found nothing did its job; it is not a skipped run. */}
+                        <SeBadge status={schedule.status === 'SKIPPED' ? 'No server errors' : schedule.status} />
+                      </td>
                       <td className="px-3 py-2 border-b text-xs text-gray-500">{fmt(schedule.last_execution)}</td>
                       <td className="px-3 py-2 border-b text-xs text-gray-500">{fmt(schedule.next_execution)}</td>
                       <td className="px-3 py-2 border-b text-xs text-gray-500">
                         {schedule.last_analysis_id ? `#${schedule.last_analysis_id}` : '-'}
-                        {schedule.last_error && (
+                        {schedule.last_error && schedule.status !== 'SKIPPED' && (
                           <p className="mt-1 text-[11px] text-red-500 break-words">{schedule.last_error}</p>
                         )}
                       </td>

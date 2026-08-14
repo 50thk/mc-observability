@@ -4,6 +4,11 @@ The worker calls the same synchronous ``POST /rca/query`` a person would, so sch
 and manual analyses share one validation, collection and storage path. They are two DAGs
 because one analysis can take tens of minutes; a dispatcher that waited on that call
 would stop noticing other schedules.
+
+A schedule with ``TRIGGER_TYPE = 'server_error'`` is a server error watch: before replaying
+the request the worker searches Tempo for HTTP 5xx server spans in the slot. No spans
+means no analysis (the slot ends as SKIPPED); the LLM is only reached when there is
+something to explain.
 """
 
 import json
@@ -22,6 +27,17 @@ WORKER_DAG_ID = "rca_schedule_worker"
 POOL = "rca_analysis"
 STALE_MINUTES = 120
 TIMEOUTS = (10, 60 * 60)  # connect, read: an RCA call is synchronous and slow
+
+# Server error watch. Only server spans: a client span's 5xx is the upstream's failure and
+# would count the same incident twice. The trailing host.name match is not a filter — it
+# makes Tempo return host.name with each matched span, which is how the request learns
+# where the errors happened without a second call.
+TRACEQL_5XX = (
+    "{ kind = server && span.http.response.status_code >= 500"
+    ' && span.http.response.status_code < 600 && resource.host.name =~ ".*" }'
+)
+TEMPO_SEARCH_LIMIT = 100
+TEMPO_TIMEOUT = 10
 
 LOGGER = logging.getLogger("rca_schedule")
 
@@ -75,7 +91,7 @@ FINISH_SQL = f"""
      WHERE ID = %s
 """
 
-SLOT_SQL = f"SELECT NEXT_EXECUTION, INTERVAL_MINUTES, REQUEST_JSON FROM {TABLE} WHERE ID = %s"
+SLOT_SQL = f"SELECT NEXT_EXECUTION, INTERVAL_MINUTES, REQUEST_JSON, TRIGGER_TYPE FROM {TABLE} WHERE ID = %s"
 
 
 def _hook():
@@ -102,6 +118,52 @@ def _rca_url() -> str:
     return f"{host}/api/o11y/insight/rca/query"
 
 
+def _tempo_url() -> str:
+    connection = BaseHook.get_connection("tempo_url")
+    host = f"{connection.schema or 'http'}://{connection.host}"
+    if connection.port:
+        host = f"{host}:{connection.port}"
+    return f"{host}/api/search"
+
+
+def _server_errors(start: str, end: str) -> list:
+    """Traces with an HTTP 5xx server span inside [start, end] (RFC3339), at most TEMPO_SEARCH_LIMIT."""
+    params = {
+        "q": TRACEQL_5XX,
+        "start": int(datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp()),
+        "end": int(datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp()),
+        "limit": TEMPO_SEARCH_LIMIT,
+    }
+    response = requests.get(_tempo_url(), params=params, timeout=TEMPO_TIMEOUT)
+    response.raise_for_status()
+    return (response.json() or {}).get("traces") or []
+
+
+def _triggered_request(request: dict, traces: list) -> dict:
+    """Fill the stored request with what the search found, without overriding what the user set."""
+    hosts, trace_ids = [], []
+    for trace in traces:
+        if trace.get("traceID") and trace["traceID"] not in trace_ids:
+            trace_ids.append(trace["traceID"])
+        for span_set in trace.get("spanSets") or []:
+            for span in span_set.get("spans") or []:
+                for attribute in span.get("attributes") or []:
+                    value = (attribute.get("value") or {}).get("stringValue")
+                    if attribute.get("key") == "host.name" and value and value not in hosts:
+                        hosts.append(value)
+    count = f"at least {len(traces)}" if len(traces) >= TEMPO_SEARCH_LIMIT else str(len(traces))
+    where = f" on {', '.join(hosts[:10])}" if hosts else ""
+    scope = dict(request.get("scope") or {})
+    scope.setdefault("status_code", "5xx")
+    scope["attributes"] = {**(scope.get("attributes") or {}), "trace_ids": trace_ids[:5], "hosts": hosts[:10]}
+    return {
+        **request,
+        "query": request.get("query")
+        or f"{count} HTTP 5xx server responses{where} in the window. Find the root cause.",
+        "scope": scope,
+    }
+
+
 def dispatch(**_context) -> None:
     released = _execute(RECOVER_SQL, (STALE_MINUTES,))
     if released:
@@ -119,6 +181,10 @@ def dispatch(**_context) -> None:
             replace_microseconds=False,
         )
         LOGGER.info("triggered worker for schedule %s", schedule_id)
+
+
+class _NoServerErrors(Exception):
+    """The watch found nothing to analyse in this slot."""
 
 
 def _utcnow() -> datetime:
@@ -167,7 +233,7 @@ def run_analysis(**context) -> None:
     rows = _hook().get_records(SLOT_SQL, parameters=(schedule_id,))
     if not rows:
         raise ValueError(f"schedule {schedule_id} no longer exists")
-    slot, interval_minutes, stored = rows[0]
+    slot, interval_minutes, stored, trigger = rows[0]
     # Claiming only flips STATUS, so NEXT_EXECUTION still holds the slot being run.
     slot = slot or _utcnow()
     stored_request = json.loads(stored) if isinstance(stored, str) else stored
@@ -175,6 +241,13 @@ def run_analysis(**context) -> None:
 
     analysis_id, error = None, None
     try:
+        if trigger == "server_error":
+            window = request["scope"]["time_range"]
+            traces = _server_errors(window["start"], window["end"])
+            if not traces:
+                raise _NoServerErrors()
+            request = _triggered_request(request, traces)
+            LOGGER.info("schedule %s: %s trace(s) with 5xx server spans, running the analysis", schedule_id, len(traces))
         response = requests.post(_rca_url(), json=request, timeout=TIMEOUTS)
         response.raise_for_status()
         analysis = ((response.json() or {}).get("data") or {}).get("analysis") or {}
@@ -182,6 +255,8 @@ def run_analysis(**context) -> None:
         result_status = analysis.get("status") or "FAILED"
         if analysis_id is None:
             result_status, error = "FAILED", "analysis id missing in response"
+    except _NoServerErrors:
+        result_status = "SKIPPED"
     except Exception as exc:  # noqa: BLE001 - every failure must still free the schedule
         result_status, error = "FAILED", f"{type(exc).__name__}: {exc}"[:500]
 

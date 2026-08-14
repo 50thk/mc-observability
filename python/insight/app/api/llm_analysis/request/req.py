@@ -211,6 +211,9 @@ class PostRcaScheduleBody(BaseModel):
         le=MAX_SCHEDULE_INTERVAL_MINUTES,
     )
     request: dict
+    # "server_error": the worker searches Tempo for HTTP 5xx server spans in the slot and
+    # runs the analysis only when it finds some. None: run every slot.
+    trigger: Literal["server_error"] | None = None
 
     @model_validator(mode="after")
     def validate_body(self):

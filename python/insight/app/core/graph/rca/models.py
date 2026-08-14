@@ -80,7 +80,8 @@ class IncidentTimeRange(BaseModel):
 class IncidentScope(BaseModel):
     trace_id: str | None = Field(default=None, min_length=1, max_length=256)
     service_name: str | None = Field(default=None, min_length=1, max_length=255)
-    status_code: str | None = Field(default=None, min_length=1, max_length=32)
+    # One HTTP code ("503") or one class ("5xx"); lists and ranges are not part of the contract.
+    status_code: str | None = Field(default=None, pattern=r"^[1-5](\d{2}|xx)$")
     endpoint: str | None = Field(default=None, min_length=1, max_length=2048)
     time_range: IncidentTimeRange = Field(default_factory=IncidentTimeRange)
     attributes: dict[str, Any] = Field(default_factory=dict)

@@ -456,6 +456,8 @@ services:
 
         airflow connections add --conn-type http --conn-host mc-observability-insight --conn-schema http --conn-port 9001 api_base_url
         airflow connections add --conn-type mysql --conn-host mc-observability-maria --conn-schema mc_observability --conn-login mc-agent --conn-password mc-agent --conn-port 3306 mcmp_db
+        # Server error watch: the RCA worker searches Tempo before running an analysis
+        airflow connections add --conn-type http --conn-host mc-observability-tempo --conn-schema http --conn-port 3200 tempo_url
         # Bound how many scheduled RCA analyses run at once; each one is long and LLM-backed
         airflow pools set rca_analysis 4 'Concurrent scheduled RCA analyses'
 

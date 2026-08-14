@@ -50,6 +50,8 @@ class RcaSchedule(Base):
     NAME = Column(String(100), nullable=False)
     ENABLED = Column(Boolean, nullable=False, default=True, server_default="1")
     INTERVAL_MINUTES = Column(Integer, nullable=False)
+    # Not `TRIGGER`: that is a reserved word in MariaDB, and the DAG queries this table with raw SQL.
+    TRIGGER_TYPE = Column(String(32), nullable=True)
     REQUEST_JSON = Column(JSON, nullable=False)
     STATUS = Column(String(20), nullable=False, default="IDLE", server_default="IDLE")
     LAST_EXECUTION = Column(DateTime, nullable=True)
