@@ -1,4 +1,6 @@
-from sqlalchemy import func
+from datetime import datetime, timedelta
+
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from app.api.llm_analysis.model.models import (
@@ -101,11 +103,12 @@ class RcaAnalysisRepository:
         session_id: str,
         request_json: dict,
         detail: dict | None = None,
+        status: str = "RUNNING",
     ):
         record = RcaAnalysis(
             TRACE_ID=trace_id,
             SESSION_ID=session_id,
-            STATUS="RUNNING",
+            STATUS=status,
             REQUEST_JSON=request_json or {},
             DETAIL_JSON=detail or {},
         )
@@ -113,6 +116,51 @@ class RcaAnalysisRepository:
         self.db.commit()
         self.db.refresh(record)
         return record
+
+    def update_status(self, analysis_id: int, status: str) -> None:
+        self.db.query(RcaAnalysis).filter_by(ID=analysis_id).update(
+            {RcaAnalysis.STATUS: status, RcaAnalysis.UPDATED_AT: func.now()},
+            synchronize_session=False,
+        )
+        self.db.commit()
+
+    def list_active(self):
+        """Analyses that are queued or running, newest first."""
+        return (
+            self.db.query(RcaAnalysis)
+            .filter(RcaAnalysis.STATUS.in_(("PENDING", "RUNNING")))
+            .order_by(RcaAnalysis.ID.desc())
+            .all()
+        )
+
+    def now(self):
+        """The database's clock, which is what UPDATED_AT is stamped with (func.now()).
+
+        The service and the database may run in different time zones, so age is never
+        computed against the process clock.
+        """
+        value = self.db.execute(select(func.now())).scalar()
+        if isinstance(value, str):  # SQLite returns CURRENT_TIMESTAMP as text
+            value = datetime.fromisoformat(value)
+        return value
+
+    def fail_stale(self, *, older_than_seconds: int, summary: str) -> int:
+        """Close analyses a dead worker left PENDING/RUNNING; returns how many."""
+        updated_before = self.now() - timedelta(seconds=older_than_seconds)
+        updated = (
+            self.db.query(RcaAnalysis)
+            .filter(RcaAnalysis.STATUS.in_(("PENDING", "RUNNING")), RcaAnalysis.UPDATED_AT < updated_before)
+            .update(
+                {
+                    RcaAnalysis.STATUS: "FAILED",
+                    RcaAnalysis.SUMMARY: summary,
+                    RcaAnalysis.UPDATED_AT: func.now(),
+                },
+                synchronize_session=False,
+            )
+        )
+        self.db.commit()
+        return int(updated or 0)
 
     def finalize(
         self,

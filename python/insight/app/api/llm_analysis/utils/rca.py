@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -20,6 +21,8 @@ from app.api.llm_analysis.response.res import (
 )
 from app.api.llm_analysis.utils.llm_model import create_chat_model
 from app.api.llm_analysis.utils.session import CommonSessionService
+from app.core.dependencies.db import SessionLocal
+from app.core.dependencies.mcp import RCA_SERVERS, build_mcp_manager
 from app.core.graph.rca import (
     SOURCE_SPECS,
     EvidenceStore,
@@ -142,10 +145,63 @@ def _persisted_tool_calls(context) -> dict:
     return persisted
 
 
+# Background analyses of this worker process. Tasks keep a strong reference here until
+# they finish; the semaphore is per event loop because tests run one loop per case.
+_ANALYSIS_TASKS: set[asyncio.Task] = set()
+_ANALYSIS_SLOTS: dict[int, asyncio.Semaphore] = {}
+_STALE_SUMMARY = "interrupted by restart"
+
+
+def _analysis_slots(limit: int) -> asyncio.Semaphore:
+    key = id(asyncio.get_running_loop())
+    if key not in _ANALYSIS_SLOTS:
+        _ANALYSIS_SLOTS[key] = asyncio.Semaphore(limit)
+    return _ANALYSIS_SLOTS[key]
+
+
+async def wait_for_analyses() -> None:
+    """Await every background analysis of this process (tests and graceful shutdown)."""
+    while _ANALYSIS_TASKS:
+        await asyncio.gather(*list(_ANALYSIS_TASKS), return_exceptions=True)
+
+
+def fail_stale_analyses(db: Session, *, older_than_seconds: int) -> int:
+    """Close PENDING/RUNNING records nobody can still be working on (a worker died)."""
+    swept = RcaAnalysisRepository(db).fail_stale(older_than_seconds=older_than_seconds, summary=_STALE_SUMMARY)
+    if swept:
+        logger.warning("rca: marked %s stale analyses FAILED (%s)", swept, _STALE_SUMMARY)
+    return swept
+
+
+def start_stale_analysis_sweeper(*, older_than_seconds: int, interval_seconds: float = 60.0, session_factory=None) -> asyncio.Task:
+    """Run fail_stale_analyses forever at an interval.
+
+    The startup sweep only sees records that were already old; an analysis orphaned seconds
+    before a restart would otherwise stay RUNNING until the next restart.
+    """
+    factory = session_factory or SessionLocal
+
+    async def _loop():
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                with factory() as db:
+                    fail_stale_analyses(db, older_than_seconds=older_than_seconds)
+            except Exception as exc:  # noqa: BLE001 - the sweeper must survive a DB hiccup
+                logger.warning("rca: stale-analysis sweep failed: %s", exc)
+
+    return asyncio.create_task(_loop(), name="rca-stale-analysis-sweeper")
+
+
+def _comparable_request(request_json: dict) -> dict:
+    """The request without its session: a proxy retrying the same POST gets a new session."""
+    return {key: value for key, value in request_json.items() if key != "session_id"}
+
+
 class RcaAnalysisService:
     """Coordinate RCA API operations, agents, graph execution, and persistence."""
 
-    def __init__(self, db: Session, mcp_manager=None, rca_graph=None):
+    def __init__(self, db: Session, mcp_manager=None, rca_graph=None, *, session_factory=None, mcp_factory=None):
         self.db = db
         self.session_repo = LogAnalysisRepository(db)
         self.analysis_repo = RcaAnalysisRepository(db)
@@ -153,10 +209,77 @@ class RcaAnalysisService:
         self.rca_graph = rca_graph
         self.config = ConfigManager()
         self.analysis_config = self.config.get_rca_analysis_config()
+        # A background analysis outlives the request, so it opens its own DB session and
+        # MCP manager from these factories instead of the request-scoped ones.
+        self._session_factory = session_factory or SessionLocal
+        self._mcp_factory = mcp_factory or (lambda: build_mcp_manager(RCA_SERVERS))
+
+    async def submit_analysis(self, body: PostRcaQueryBody) -> RcaQueryResult:
+        """Record the request and start the analysis in the background; answer at once."""
+        session, resolved, request_json = self._resolve(body)
+
+        # A proxy that times out and re-sends the same POST must not start a second
+        # analysis; hand back the one already in flight.
+        wanted = _comparable_request(request_json)
+        for active in self.analysis_repo.list_active():
+            if _comparable_request(active.REQUEST_JSON or {}) == wanted:
+                return RcaQueryResult(
+                    session_id=active.SESSION_ID,
+                    message=Message(message_type="ai", message=f"Analysis #{active.ID} is already running"),
+                    analysis=self._to_record(active),
+                )
+
+        limit = int(self.analysis_config["max_concurrent_analyses"])
+        if len(_ANALYSIS_TASKS) >= limit + int(self.analysis_config["max_queued_analyses"]):
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="too many analyses queued")
+
+        record = self.analysis_repo.create_record(
+            trace_id=resolved.scope.trace_id,
+            session_id=session.SESSION_ID,
+            request_json=request_json,
+            status="PENDING",
+        )
+        task = asyncio.create_task(
+            self._run_in_background(record.ID, session.SESSION_ID, session.MODEL_NAME, session.CONNECTION_ID, resolved, limit),
+            name=f"rca-analysis-{record.ID}",
+        )
+        _ANALYSIS_TASKS.add(task)
+        task.add_done_callback(_ANALYSIS_TASKS.discard)
+        return RcaQueryResult(
+            session_id=session.SESSION_ID,
+            message=Message(message_type="ai", message=f"Analysis #{record.ID} started"),
+            analysis=self._to_record(record),
+        )
+
+    async def _run_in_background(self, record_id, session_id, model_name, connection_id, resolved, limit):
+        async with _analysis_slots(limit):
+            db = self._session_factory()
+            try:
+                RcaAnalysisRepository(db).update_status(record_id, "RUNNING")
+                async with self._mcp_factory() as manager:
+                    runner = RcaAnalysisService(
+                        db=db, mcp_manager=manager, rca_graph=self.rca_graph,
+                        session_factory=self._session_factory, mcp_factory=self._mcp_factory,
+                    )
+                    runner.analysis_config = self.analysis_config
+                    await runner._execute(record_id, session_id, model_name, connection_id, resolved, time.perf_counter())
+            except Exception as exc:  # noqa: BLE001 - _execute finalized the record; nobody else can observe this
+                logger.warning("rca: background analysis %s failed: %s", record_id, exc)
+            finally:
+                db.close()
 
     async def query_rca(self, body: PostRcaQueryBody) -> RcaQueryResult:
-        """Run RCA through the service-owned record lifecycle and graph."""
+        """Run RCA to completion in the caller's task (tests and in-process callers)."""
         started_at = time.perf_counter()
+        session, resolved, request_json = self._resolve(body)
+        record = self.analysis_repo.create_record(
+            trace_id=resolved.scope.trace_id,
+            session_id=session.SESSION_ID,
+            request_json=request_json,
+        )
+        return await self._execute(record.ID, session.SESSION_ID, session.MODEL_NAME, session.CONNECTION_ID, resolved, started_at)
+
+    def _resolve(self, body: PostRcaQueryBody):
         session = CommonSessionService(self.db).get_or_create_session(
             analysis_type="rca",
             session_id=body.session_id,
@@ -172,19 +295,16 @@ class RcaAnalysisService:
                 "session_id": session.SESSION_ID,
             }
         )
-        request_json = resolved.model_dump(mode="json", exclude_none=True)
-        record = self.analysis_repo.create_record(
-            trace_id=resolved.scope.trace_id,
-            session_id=session.SESSION_ID,
-            request_json=request_json,
-        )
+        return session, resolved, resolved.model_dump(mode="json", exclude_none=True)
 
+    async def _execute(self, record_id: int, session_id: str, model_name, connection_id, resolved: PostRcaQueryBody, started_at: float) -> RcaQueryResult:
+        """Run the graph for an existing record and finalize it; raises after finalizing on failure."""
         context = None
         try:
-            with TemporaryDirectory(prefix=f"rca-{record.ID}-") as directory:
+            with TemporaryDirectory(prefix=f"rca-{record_id}-") as directory:
                 context = await self._create_rca_context(
-                    session.MODEL_NAME,
-                    session.CONNECTION_ID,
+                    model_name,
+                    connection_id,
                     storage_dir=Path(directory),
                     scope=resolved.scope,
                 )
@@ -192,7 +312,7 @@ class RcaAnalysisService:
                 with get_usage_metadata_callback() as usage_callback:
                     graph_result = await self._get_rca_graph().ainvoke(
                         {
-                            "session_id": session.SESSION_ID,
+                            "session_id": session_id,
                             "query": resolved.query,
                             "scope": resolved.scope.model_dump(mode="json"),
                             "filters": resolved.filters,
@@ -208,13 +328,13 @@ class RcaAnalysisService:
         except Exception as exc:
             error_message = str(exc)
             self.analysis_repo.finalize(
-                record.ID,
+                record_id,
                 status="FAILED",
                 summary=error_message,
                 detail={"error_message": error_message, **_persisted_tool_calls(context)},
             )
             self._log_operational_summary(
-                record.ID,
+                record_id,
                 started_at,
                 {"result_validation": {"status": "FAILED"}, "error_message": error_message},
                 context,
@@ -252,15 +372,15 @@ class RcaAnalysisService:
         else:
             final_status = "SUCCEEDED"
         updated_record = self.analysis_repo.finalize(
-            record.ID,
+            record_id,
             status=final_status,
             summary=summary,
             detail=detail,
         )
-        self._log_operational_summary(record.ID, started_at, graph_result, context)
+        self._log_operational_summary(record_id, started_at, graph_result, context)
 
         return RcaQueryResult(
-            session_id=session.SESSION_ID,
+            session_id=session_id,
             message=Message(message_type="ai", message=summary),
             analysis=self._to_record(updated_record),
         )

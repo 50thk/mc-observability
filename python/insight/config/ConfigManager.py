@@ -121,6 +121,10 @@ class ConfigManager:
             "investigation_model_call_limit": rca.get("investigation_model_call_limit", 24),
             "investigation_tool_call_limit": rca.get("investigation_tool_call_limit", 24),
             "analysis_timeout_seconds": rca.get("analysis_timeout_seconds", 300),
+            # POST /rca/query answers at once and runs the analysis in the background of the
+            # worker process; these bound how many run and how many wait per process.
+            "max_concurrent_analyses": rca.get("max_concurrent_analyses", 4),
+            "max_queued_analyses": rca.get("max_queued_analyses", 20),
             # Optimistic on purpose (matches config.yaml): an under-guess wastes a large model's
             # capacity silently, while an over-guess surfaces as a visible provider error.
             "fallback_context_window_tokens": rca.get("fallback_context_window_tokens", 200000),

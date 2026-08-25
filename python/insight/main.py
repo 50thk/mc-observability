@@ -15,6 +15,8 @@ from app.api.llm_analysis import (
 )
 from app.api.prediction import prediction
 from app.api.readyz import readyz
+from app.api.llm_analysis.utils.rca import fail_stale_analyses, start_stale_analysis_sweeper
+from app.core.dependencies.db import SessionLocal
 from app.core.dependencies.migrations import run_startup_migrations
 from app.core.graph.rca import build_rca_graph
 from app.core.otel.log import init_otel_logger
@@ -30,8 +32,21 @@ config = ConfigManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_startup_migrations()
+    # Analyses run in the background of a worker process; ones a dead worker left behind
+    # would otherwise stay RUNNING forever.
+    try:
+        with SessionLocal() as db:
+            fail_stale_analyses(
+                db, older_than_seconds=config.get_rca_analysis_config()["analysis_timeout_seconds"] + 60
+            )
+    except Exception as exc:  # noqa: BLE001 - a sweep that cannot run must not stop the service
+        logging.getLogger(__name__).warning("rca: stale-analysis sweep skipped: %s", exc)
+    sweeper = start_stale_analysis_sweeper(
+        older_than_seconds=config.get_rca_analysis_config()["analysis_timeout_seconds"] + 60
+    )
     app.state.rca_graph = build_rca_graph()
     yield
+    sweeper.cancel()
 
 
 app = FastAPI(title="Insight Module DOCS", description="mc-observability insight module", lifespan=lifespan)

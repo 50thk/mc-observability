@@ -24,7 +24,6 @@ from app.api.llm_analysis.response.res import (
 from app.api.llm_analysis.utils.rca import RcaAnalysisService
 from app.api.llm_analysis.utils.rca_schedule import RcaScheduleService
 from app.core.dependencies.db import get_db
-from app.core.dependencies.mcp import get_rca_context
 
 router = APIRouter()
 
@@ -35,19 +34,17 @@ router = APIRouter()
     responses=post_rca_query_description["response"],
     response_model=ResBodyRcaQuery,
     operation_id="PostRcaQuery",
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def query_rca(
     request: Request,
     body_params: PostRcaQueryBody,
     db: Session = Depends(get_db),
-    mcp_context=Depends(get_rca_context),
 ):
-    service = RcaAnalysisService(
-        db=db,
-        mcp_manager=mcp_context,
-        rca_graph=request.app.state.rca_graph,
-    )
-    return ResBodyRcaQuery(data=await service.query_rca(body_params))
+    # Accepted, not completed: the record comes back at once and the analysis runs in the
+    # background; clients read the result from GET /rca/records/{id}.
+    service = RcaAnalysisService(db=db, rca_graph=request.app.state.rca_graph)
+    return ResBodyRcaQuery(data=await service.submit_analysis(body_params))
 
 
 @router.get(

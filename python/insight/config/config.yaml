@@ -204,6 +204,10 @@ rca_analysis:
   investigation_model_call_limit: 24
   investigation_tool_call_limit: 24
   analysis_timeout_seconds: 300
+  # POST /rca/query returns the record immediately (202) and runs the analysis in the
+  # background of the worker process. Per process: how many run at once, how many may wait.
+  max_concurrent_analyses: 4
+  max_queued_analyses: 20
   # Used only when neither the LLM connection's context_length nor the provider knows the
   # window. Optimistic on purpose: an under-guess wastes a large model's capacity silently,
   # while an over-guess is announced by a warning log naming the connection to fix.
