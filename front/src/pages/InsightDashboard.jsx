@@ -1,11 +1,11 @@
-import { useState, useEffect, useCallback, Fragment } from 'react';
+import { useState, useEffect, useCallback, useRef, Fragment } from 'react';
 import { useParams } from 'react-router-dom';
 import {
   getAnomalySettings, createAnomalySetting, deleteAnomalySetting, getAnomalyHistory,
   getAnomalyMeasurements, getAnomalyOptions,
   getPredictionHistory, runPrediction, getPredictionOptions,
   getRcaRecords, queryRca,
-  getRcaSchedules, createRcaSchedule, updateRcaSchedule, deleteRcaSchedule,
+  getRcaSchedules, createRcaSchedule, updateRcaSchedule, deleteRcaSchedule, getRcaRecord,
   getLlmConnections, createLlmConnection, updateLlmConnection, setDefaultLlmConnection,
   deleteLlmConnection, getLlmConnectionModels,
 } from '../api/insight';
@@ -494,6 +494,9 @@ function RcaTab({ nsId, infraId, nodeId }) {
   const [scheduleInterval, setScheduleInterval] = useState(15);
   const [scheduleBusyId, setScheduleBusyId] = useState(null);
   const [showWatchForm, setShowWatchForm] = useState(false);
+  // Bumped on unmount so a poll loop that outlives the page stops touching state.
+  const pollToken = useRef(0);
+  useEffect(() => () => { pollToken.current += 1; }, []);
   const [watchName, setWatchName] = useState('');
   const [watchInterval, setWatchInterval] = useState(15);
   const [deletingId, setDeletingId] = useState(null);
@@ -689,6 +692,32 @@ function RcaTab({ nsId, infraId, nodeId }) {
     }
   }
 
+  const RUNNING_STATES = ['PENDING', 'RUNNING'];
+
+  // POST /rca/query answers at once with the record; the analysis runs on the server.
+  // Poll the record until it settles, then open it.
+  async function pollAnalysis(id) {
+    const token = pollToken.current;
+    const startedAt = Date.now();
+    try {
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        if (pollToken.current !== token) return;
+        const record = await getRcaRecord(id);
+        if (!RUNNING_STATES.includes(record?.status)) {
+          setMsg(`Analysis #${id} ${String(record?.status || '').toLowerCase()}`);
+          setSelected(id);
+          if (page === 1) await load();
+          else setPage(1);
+          return;
+        }
+        setMsg(`Analysis #${id} ${record.status === 'PENDING' ? 'queued' : 'running'}… ${Math.round((Date.now() - startedAt) / 1000)}s`);
+      }
+    } catch (e) {
+      setMsg(`Analysis #${id}: could not read its status (${apiError(e)}). It keeps running; refresh the list later.`);
+    }
+  }
+
   async function handleAnalyze() {
     let body;
     try {
@@ -713,10 +742,12 @@ function RcaTab({ nsId, infraId, nodeId }) {
     setMsg('');
     try {
       const res = await queryRca(body);
-      setMsg(`Analysis #${res?.analysis?.id || '-'} finished`);
+      const id = res?.analysis?.id;
       setShowAnalysisForm(false);
+      setMsg(`Analysis #${id || '-'} started`);
       if (page === 1) await load();
       else setPage(1);
+      if (id) pollAnalysis(id);
     } catch (e) {
       setMsg('Analysis failed: ' + apiError(e));
     } finally {
@@ -1172,7 +1203,7 @@ function RcaTab({ nsId, infraId, nodeId }) {
                 {enabledConnections.length === 0 ? (
                   <p className="text-xs font-medium text-amber-700">Add an enabled LLM connection before starting an analysis.</p>
                 ) : (
-                  <p className="text-xs text-slate-500">The analysis can take a few minutes. Keep this page open until it finishes.</p>
+                  <p className="text-xs text-slate-500">The analysis runs on the server for a few minutes; the result appears in the list below (you may leave this page).</p>
                 )}
               </div>
               <div className="flex flex-wrap items-end gap-2">

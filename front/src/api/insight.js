@@ -84,8 +84,14 @@ export async function getRcaRecords({ status, from, to, page = 1, size = 20 } = 
   return res.data?.data || {};
 }
 
+// Answers 202 with the record; the analysis runs on the server. Poll getRcaRecord for the result.
 export async function queryRca(body) {
   const res = await client.post('/api/o11y/insight/rca/query', body);
+  return res.data?.data || res.data;
+}
+
+export async function getRcaRecord(analysisId) {
+  const res = await client.get(`/api/o11y/insight/rca/records/${analysisId}`);
   return res.data?.data || res.data;
 }
 

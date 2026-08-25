@@ -1,9 +1,11 @@
 """Repeated RCA analyses: a dispatcher that claims due schedules and a worker that runs one.
 
-The worker calls the same synchronous ``POST /rca/query`` a person would, so scheduled
-and manual analyses share one validation, collection and storage path. They are two DAGs
-because one analysis can take tens of minutes; a dispatcher that waited on that call
-would stop noticing other schedules.
+The worker calls the same ``POST /rca/query`` a person would, so scheduled and manual
+analyses share one validation, collection and storage path. The API answers at once with
+the record and runs the analysis in the background; the worker then polls
+``GET /rca/records/{id}`` until the record reaches a terminal status. They are two DAGs
+because one analysis can take tens of minutes; a dispatcher that waited on it would stop
+noticing other schedules.
 
 A schedule with ``TRIGGER_TYPE = 'server_error'`` is a server error watch: before replaying
 the request the worker searches Tempo for HTTP 5xx server spans in the slot. No spans
@@ -26,7 +28,10 @@ TABLE = "mc_o11y_insight_rca_schedule"
 WORKER_DAG_ID = "rca_schedule_worker"
 POOL = "rca_analysis"
 STALE_MINUTES = 120
-TIMEOUTS = (10, 60 * 60)  # connect, read: an RCA call is synchronous and slow
+TIMEOUTS = (10, 30)  # connect, read: POST /rca/query only records the request now
+POLL_SECONDS = 15  # how often the worker asks whether the analysis has finished
+POLL_MAX_CONSECUTIVE_FAILURES = 8  # ~2 minutes of insight being unreachable before giving up
+MAX_WAIT_MINUTES = 60  # an analysis still not finished after this is reported, not awaited
 
 # Server error watch. Only server spans: a client span's 5xx is the upstream's failure and
 # would count the same incident twice. The trailing host.name match is not a filter — it
@@ -110,12 +115,43 @@ def _execute(sql: str, parameters: tuple) -> int:
         connection.close()
 
 
-def _rca_url() -> str:
+def _insight_url(path: str) -> str:
     connection = BaseHook.get_connection("api_base_url")
     host = f"{connection.schema}://{connection.host}"
     if connection.port:
         host = f"{host}:{connection.port}"
-    return f"{host}/api/o11y/insight/rca/query"
+    return f"{host}/api/o11y/insight/rca/{path}"
+
+
+def _rca_url() -> str:
+    return _insight_url("query")
+
+
+def _wait_for_analysis(analysis_id: int, max_wait_minutes: int) -> str:
+    """Poll the record until it leaves PENDING/RUNNING; returns the final status."""
+    import time
+
+    deadline = time.monotonic() + max_wait_minutes * 60
+    status = "RUNNING"
+    failures = 0
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(_insight_url(f"records/{analysis_id}"), timeout=TIMEOUTS)
+            response.raise_for_status()
+            failures = 0
+        except requests.RequestException as exc:
+            # insight restarts and redeploys are routine; the record survives them.
+            failures += 1
+            if failures > POLL_MAX_CONSECUTIVE_FAILURES:
+                raise
+            LOGGER.warning("analysis %s: poll failed (%s/%s): %s", analysis_id, failures, POLL_MAX_CONSECUTIVE_FAILURES, exc)
+            time.sleep(POLL_SECONDS)
+            continue
+        status = ((response.json() or {}).get("data") or {}).get("status") or "FAILED"
+        if status not in ("PENDING", "RUNNING"):
+            return status
+        time.sleep(POLL_SECONDS)
+    raise TimeoutError(f"analysis {analysis_id} still {status} after {max_wait_minutes} minutes")
 
 
 def _tempo_url() -> str:
@@ -252,9 +288,10 @@ def run_analysis(**context) -> None:
         response.raise_for_status()
         analysis = ((response.json() or {}).get("data") or {}).get("analysis") or {}
         analysis_id = analysis.get("id")
-        result_status = analysis.get("status") or "FAILED"
         if analysis_id is None:
-            result_status, error = "FAILED", "analysis id missing in response"
+            raise ValueError("analysis id missing in response")
+        # The record is ours from here on; a slot may not wait longer than its interval.
+        result_status = _wait_for_analysis(int(analysis_id), min(int(interval_minutes), MAX_WAIT_MINUTES))
     except _NoServerErrors:
         result_status = "SKIPPED"
     except Exception as exc:  # noqa: BLE001 - every failure must still free the schedule
