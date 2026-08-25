@@ -71,7 +71,9 @@ def is_identifier(value: Any) -> bool:
 
 
 def rfc3339(value: datetime) -> str:
-    return value.isoformat().replace("+00:00", "Z")
+    # Whole seconds only: mcp-grafana's Loki tools (>= v0.16.0) parse these with go-datemath,
+    # which accepts at most three fractional digits; isoformat() would emit six.
+    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def incident_window(scope: IncidentScope) -> tuple[str, str]:
