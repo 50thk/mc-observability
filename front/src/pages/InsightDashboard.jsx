@@ -493,18 +493,16 @@ function RcaTab({ nsId, infraId, nodeId }) {
   const [scheduleName, setScheduleName] = useState('');
   const [scheduleInterval, setScheduleInterval] = useState(15);
   const [scheduleBusyId, setScheduleBusyId] = useState(null);
-  const [showWatchForm, setShowWatchForm] = useState(false);
+  // What the form produces: one analysis now, a repeating schedule, or a server-error watch.
+  const [mode, setMode] = useState('once');
   // Bumped on unmount so a poll loop that outlives the page stops touching state.
   const pollToken = useRef(0);
   useEffect(() => () => { pollToken.current += 1; }, []);
-  const [watchName, setWatchName] = useState('');
-  const [watchInterval, setWatchInterval] = useState(15);
   const [deletingId, setDeletingId] = useState(null);
   const [defaultingId, setDefaultingId] = useState(null);
   const [editingId, setEditingId] = useState(null);
   const [showConnectionForm, setShowConnectionForm] = useState(false);
   const [showAnalysisForm, setShowAnalysisForm] = useState(false);
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const enabledConnections = llmConnections.filter((connection) => connection.enabled);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
@@ -618,16 +616,20 @@ function RcaTab({ nsId, infraId, nodeId }) {
     loadSchedules().catch(() => { /* surfaced when a schedule action runs */ });
   }, [loadSchedules]);
 
+  // Schedules and watches are the same object (POST /rca/schedules); a watch adds
+  // trigger="server_error" and needs no question, time range or status code.
   async function handleSaveSchedule() {
     let request;
     try {
-      // No timeStart/timeEnd: a schedule's window comes from the slot being run, and
-      // the API rejects a stored time_range outright.
-      request = buildRcaRequest({
-        query, traceId, connectionId, modelName,
-        serviceName, endpoint, statusCode, measurement,
-        filters: additionalFilters,
-      }, { nsId, infraId, nodeId });
+      // No timeStart/timeEnd: a schedule's window comes from the slot being run, and the
+      // API rejects a stored time_range outright.
+      request = mode === 'watch'
+        ? buildRcaRequest({ connectionId, modelName, serviceName, measurement, filters: additionalFilters }, { nsId, infraId, nodeId })
+        : buildRcaRequest({
+          query, traceId, connectionId, modelName,
+          serviceName, endpoint, statusCode, measurement,
+          filters: additionalFilters,
+        }, { nsId, infraId, nodeId });
     } catch (e) {
       setMsg(e.message);
       return;
@@ -639,42 +641,25 @@ function RcaTab({ nsId, infraId, nodeId }) {
         name: scheduleName.trim(),
         enabled: true,
         interval_minutes: Number(scheduleInterval),
+        ...(mode === 'watch' ? { trigger: 'server_error' } : {}),
         request,
       });
       setScheduleName('');
+      setShowAnalysisForm(false);
       await loadSchedules();
-      setMsg(`Schedule "${scheduleName.trim()}" saved. It runs every ${scheduleInterval} minutes.`);
+      setMsg(mode === 'watch'
+        ? `Watch "${scheduleName.trim()}" saved. Every ${scheduleInterval} minutes it checks for server errors and analyses them when found.`
+        : `Schedule "${scheduleName.trim()}" saved. It runs every ${scheduleInterval} minutes.`);
     } catch (e) {
-      setMsg('Saving the schedule failed: ' + apiError(e));
+      setMsg('Saving failed: ' + apiError(e));
     } finally {
       setBusy(false);
     }
   }
 
-  // A server error watch is a schedule with trigger="server_error": the worker searches
-  // Tempo for HTTP 5xx server spans in each interval and analyses only when it finds some.
-  // No question, time or status code to fill in — the watch defines them.
-  async function handleSaveWatch() {
-    const request = buildRcaRequest({ connectionId, modelName }, { nsId, infraId, nodeId });
-    setBusy(true);
-    setMsg('');
-    try {
-      await createRcaSchedule({
-        name: watchName.trim(),
-        enabled: true,
-        interval_minutes: Number(watchInterval),
-        trigger: 'server_error',
-        request,
-      });
-      setWatchName('');
-      setShowWatchForm(false);
-      await loadSchedules();
-      setMsg(`Watch "${watchName.trim()}" saved. Every ${watchInterval} minutes it checks for server errors and analyses them when found.`);
-    } catch (e) {
-      setMsg('Saving the watch failed: ' + apiError(e));
-    } finally {
-      setBusy(false);
-    }
+  function handleSubmit() {
+    if (mode === 'once') return handleAnalyze();
+    return handleSaveSchedule();
   }
 
   async function handleScheduleAction(schedule, body) {
@@ -863,81 +848,18 @@ function RcaTab({ nsId, infraId, nodeId }) {
         <div className="px-4 py-3 border-b flex flex-wrap items-center gap-3">
           <span className="font-semibold text-sm">Automatic RCA</span>
           <span className="text-xs text-gray-400">
-            Saved requests re-run on their interval. Results appear in the analyses list below.
+            Schedules repeat a question on an interval; watches analyse HTTP 5xx server errors when they occur.
           </span>
-          <button type="button" onClick={() => setShowWatchForm((current) => !current)}
-            aria-expanded={showWatchForm}
+          <button type="button"
+            onClick={() => { setMode('schedule'); setShowAnalysisForm(true); document.getElementById('rca-analysis-form')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }}
             className="ml-auto rounded-md border border-purple-600 px-3 py-1.5 text-xs font-semibold text-purple-700 hover:bg-purple-50">
-            {showWatchForm ? 'Close' : '+ Watch for server errors'}
+            + New schedule or watch
           </button>
         </div>
-        {showWatchForm && (
-          <div className="border-b bg-slate-50/50 px-4 py-3 space-y-3">
-            <div>
-              <p className="text-sm font-medium text-slate-800">Watch for server errors</p>
-              <p className="text-xs text-slate-500">
-                Every N minutes, check for HTTP 5xx server errors and run a root-cause analysis
-                automatically when any are found. Nothing runs when there are none.
-              </p>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-              <label className="text-xs text-gray-600">
-                Name
-                <input value={watchName} onChange={(e) => setWatchName(e.target.value)} maxLength={100}
-                  placeholder="payment 5xx" className="mt-1 block border rounded px-3 py-1.5 text-sm text-gray-700 w-full" />
-              </label>
-              <label className="text-xs text-gray-600">
-                Every (min)
-                <input type="number" min={5} max={10080} value={watchInterval}
-                  onChange={(e) => setWatchInterval(e.target.value)}
-                  className="mt-1 block border rounded px-3 py-1.5 text-sm text-gray-700 w-full" />
-              </label>
-              <label className="text-xs text-gray-600">
-                Connection
-                <select value={connectionId} disabled={enabledConnections.length === 0}
-                  onChange={(e) => {
-                    const nextId = e.target.value;
-                    const connection = enabledConnections.find((item) => String(item.id) === nextId);
-                    setConnectionId(nextId);
-                    setConnectionModels(connection?.default_model ? [connection.default_model] : []);
-                    setModelName(connection?.default_model || '');
-                  }}
-                  className="mt-1 block border rounded px-2 py-1.5 text-sm w-full disabled:bg-gray-100">
-                  {enabledConnections.length === 0 && <option value="">No enabled connection</option>}
-                  {enabledConnections.map((connection) => (
-                    <option key={connection.id} value={connection.id}>{connection.name} ({connection.provider})</option>
-                  ))}
-                </select>
-              </label>
-              <label className="text-xs text-gray-600">
-                Model
-                <select value={modelName} disabled={connectionModels.length === 0}
-                  onChange={(e) => setModelName(e.target.value)}
-                  className="mt-1 block border rounded px-2 py-1.5 text-sm w-full disabled:bg-gray-100">
-                  {connectionModels.length === 0 && <option value="">No model</option>}
-                  {connectionModels.map((mn) => <option key={mn} value={mn}>{mn}</option>)}
-                </select>
-              </label>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs text-slate-500">Scope</span>
-              {nsId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">NS {nsId}</span>}
-              {infraId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">Infra {infraId}</span>}
-              {nodeId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">Node {nodeId}</span>}
-              {!nsId && !infraId && !nodeId && <span className="text-xs text-slate-400">all namespaces</span>}
-              <button type="button" onClick={handleSaveWatch}
-                disabled={busy || !watchName.trim() || !connectionId || !modelName}
-                className="ml-auto rounded-md bg-purple-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-purple-700 disabled:cursor-not-allowed disabled:opacity-50">
-                Save
-              </button>
-            </div>
-          </div>
-        )}
         <div className="p-4 overflow-auto">
           {schedules.length === 0 ? (
             <p className="text-sm text-gray-400">
-              No schedules yet — “+ Watch for server errors” analyses 5xx errors as they happen; “Save as schedule”
-              under “+ New Analysis” repeats a question on an interval.
+              No schedules yet — use “+ New schedule or watch” and pick “Repeat on a schedule” or “Watch for server errors”.
             </p>
           ) : (
             <table className="w-full text-sm">
@@ -1050,193 +972,242 @@ function RcaTab({ nsId, infraId, nodeId }) {
         {showAnalysisForm && (
           <form
             id="rca-analysis-form"
-            onSubmit={(e) => { e.preventDefault(); handleAnalyze(); }}
-            className="p-4 border-b bg-gray-50 space-y-3"
+            onSubmit={(e) => { e.preventDefault(); handleSubmit(); }}
+            className="p-4 border-b bg-gray-50 space-y-4"
           >
-            <div>
-              <label htmlFor="rca-query" className="block text-xs font-medium text-gray-700 mb-1">Analysis request</label>
-              <textarea id="rca-query" value={query} onChange={(e) => setQuery(e.target.value)}
-                maxLength={8000}
-                className="border rounded px-3 py-2 text-sm w-full h-20 bg-white"
-                placeholder="Describe the incident or question to investigate" />
-            </div>
-            <p className="text-xs text-gray-500">
-              Start and End are optional; leave them empty to analyse the last 30 minutes. Provide both if you set either.
-            </p>
-            <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
-              <div>
-                <label htmlFor="rca-trace-id" className="block text-xs text-gray-600 mb-1">Trace ID</label>
-                <input id="rca-trace-id" value={traceId} onChange={(e) => setTraceId(e.target.value)}
-                  className="border rounded px-3 py-1.5 text-sm w-full" />
+            {/* 1. What to create — decides which fields below apply. */}
+            <div className="rounded-lg border border-slate-200 bg-white p-3 space-y-3">
+              <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="What to create">
+                {[
+                  ['once', 'Run once', 'Analyse a question now'],
+                  ['schedule', 'Repeat on a schedule', 'Re-ask the question every N minutes'],
+                  ['watch', 'Watch for server errors', 'Every N minutes, analyse HTTP 5xx server errors if any occurred'],
+                ].map(([value, label, hint]) => (
+                  <button key={value} type="button" role="radio" aria-checked={mode === value}
+                    onClick={() => setMode(value)}
+                    className={`flex-1 min-w-[12rem] rounded-md border px-3 py-2 text-left ${mode === value
+                      ? 'border-purple-600 bg-purple-50 text-purple-800'
+                      : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}>
+                    <span className="block text-sm font-medium">{label}</span>
+                    <span className="block text-[11px] text-slate-500">{hint}</span>
+                  </button>
+                ))}
               </div>
-              <div>
-                <label htmlFor="rca-time-start" className="block text-xs text-gray-600 mb-1">Start</label>
-                <input id="rca-time-start" type="datetime-local" value={timeStart} onChange={(e) => setTimeStart(e.target.value)}
-                  className="border rounded px-3 py-1.5 text-sm w-full" />
-              </div>
-              <div>
-                <label htmlFor="rca-time-end" className="block text-xs text-gray-600 mb-1">End</label>
-                <input id="rca-time-end" type="datetime-local" value={timeEnd} onChange={(e) => setTimeEnd(e.target.value)}
-                  className="border rounded px-3 py-1.5 text-sm w-full" />
-              </div>
-              <div>
-                <label htmlFor="rca-connection" className="block text-xs text-gray-600 mb-1">Connection</label>
-                <select
-                  id="rca-connection"
-                  value={connectionId}
-                  disabled={enabledConnections.length === 0}
-                  onChange={(e) => {
-                    const nextId = e.target.value;
-                    const connection = enabledConnections.find((item) => String(item.id) === nextId);
-                    setConnectionId(nextId);
-                    setConnectionModels(connection?.default_model ? [connection.default_model] : []);
-                    setModelName(connection?.default_model || '');
-                  }}
-                  className="border rounded px-2 py-1.5 text-sm w-full disabled:bg-gray-100"
-                >
-                  {enabledConnections.length === 0 && <option value="">No enabled connection</option>}
-                  {enabledConnections.map((connection) => (
-                    <option key={connection.id} value={connection.id}>
-                      {connection.name} ({connection.provider})
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="rca-model" className="block text-xs text-gray-600 mb-1">Model</label>
-                <select id="rca-model" value={modelName} disabled={connectionModels.length === 0}
-                  onChange={(e) => setModelName(e.target.value)}
-                  className="border rounded px-2 py-1.5 text-sm w-full disabled:bg-gray-100">
-                  {connectionModels.length === 0 && <option value="">No model</option>}
-                  {connectionModels.map((mn) => <option key={mn} value={mn}>{mn}</option>)}
-                </select>
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center gap-2 rounded border border-slate-200 bg-white px-3 py-2">
-              <span className="text-xs font-medium text-slate-600">Analysis context</span>
-              {nsId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">NS {nsId}</span>}
-              {infraId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">Infra {infraId}</span>}
-              {nodeId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">Node {nodeId}</span>}
-              {!nsId && !infraId && !nodeId && <span className="text-xs text-gray-400">No route scope</span>}
-            </div>
-            <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
-              <button type="button" onClick={() => setShowAdvanced((show) => !show)}
-                aria-expanded={showAdvanced} aria-controls="rca-advanced-scope"
-                className="flex w-full items-center justify-between gap-3 px-3 py-3 text-left hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-purple-500">
-                <span className="min-w-0">
-                  <span className="block text-sm font-medium text-slate-800">Investigation scope</span>
-                  <span className="block text-xs text-slate-500">
-                    Optional service, endpoint, metric source, and custom filters
-                  </span>
-                </span>
-                <span className="flex shrink-0 items-center gap-2">
-                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-500">Optional</span>
-                  <svg aria-hidden="true" viewBox="0 0 20 20"
-                    className={`h-4 w-4 text-slate-400 transition-transform ${showAdvanced ? 'rotate-180' : ''}`}>
-                    <path d="m5 7.5 5 5 5-5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
-                  </svg>
-                </span>
-              </button>
-              {showAdvanced && (
-                <div id="rca-advanced-scope" className="space-y-3 border-t border-slate-200 bg-slate-50/50 p-3">
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
-                  <div>
-                    <label htmlFor="rca-service-name" className="block text-xs text-gray-600 mb-1">Service</label>
-                    <input id="rca-service-name" value={serviceName} onChange={(e) => setServiceName(e.target.value)}
-                      className="border rounded px-3 py-1.5 text-sm w-full" placeholder="checkout-api" />
+              {mode !== 'once' && (
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                  <div className="md:col-span-3">
+                    <label htmlFor="rca-schedule-name" className="block text-xs text-gray-600 mb-1">Name</label>
+                    <input id="rca-schedule-name" value={scheduleName} onChange={(e) => setScheduleName(e.target.value)} maxLength={100}
+                      placeholder={mode === 'watch' ? 'payment 5xx' : 'checkout errors'}
+                      className="border rounded px-3 py-1.5 text-sm w-full" />
                   </div>
                   <div>
-                    <label htmlFor="rca-endpoint" className="block text-xs text-gray-600 mb-1">Endpoint</label>
-                    <input id="rca-endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)}
-                      className="border rounded px-3 py-1.5 text-sm w-full" placeholder="POST /checkout" />
+                    <label htmlFor="rca-schedule-interval" className="block text-xs text-gray-600 mb-1">Every (min)</label>
+                    <input id="rca-schedule-interval" type="number" min={5} max={10080} value={scheduleInterval}
+                      onChange={(e) => setScheduleInterval(e.target.value)}
+                      className="border rounded px-3 py-1.5 text-sm w-full" />
                   </div>
-                  <div>
-                    <label htmlFor="rca-status-code" className="block text-xs text-gray-600 mb-1">HTTP status code</label>
-                    <input id="rca-status-code" value={statusCode} onChange={(e) => setStatusCode(e.target.value)}
-                      className="border rounded px-3 py-1.5 text-sm w-full" placeholder="500" />
-                  </div>
-                  <div>
-                    <label htmlFor="rca-measurement" className="block text-xs text-gray-600 mb-1">Measurement</label>
-                    <input id="rca-measurement" value={measurement} onChange={(e) => setMeasurement(e.target.value)}
-                      className="border rounded px-3 py-1.5 text-sm w-full" placeholder="http_requests" />
-                  </div>
-                </div>
-                <div>
-                  <div className="mb-2 flex items-center justify-between">
-                    <span className="text-xs font-medium text-gray-700">Additional filters</span>
-                    <button type="button"
-                      onClick={() => setAdditionalFilters((current) => [...current, { key: '', value: '' }])}
-                      className="text-xs text-blue-600 hover:text-blue-800">+ Add filter</button>
-                  </div>
-                  <div className="space-y-2">
-                    {additionalFilters.map((filter, index) => (
-                      <div key={index} className="flex gap-2">
-                        <input aria-label={`Additional filter ${index + 1} key`} value={filter.key}
-                          onChange={(e) => setAdditionalFilters((current) => current.map((item, itemIndex) => (
-                            itemIndex === index ? { ...item, key: e.target.value } : item
-                          )))}
-                          className="border rounded px-3 py-1.5 text-sm flex-1 min-w-0" placeholder="Key, e.g. region" />
-                        <input aria-label={`Additional filter ${index + 1} value`} value={filter.value}
-                          onChange={(e) => setAdditionalFilters((current) => current.map((item, itemIndex) => (
-                            itemIndex === index ? { ...item, value: e.target.value } : item
-                          )))}
-                          className="border rounded px-3 py-1.5 text-sm flex-1 min-w-0" placeholder="Value" />
-                        <button type="button" aria-label={`Remove additional filter ${index + 1}`}
-                          onClick={() => setAdditionalFilters((current) => (
-                            current.length === 1
-                              ? [{ key: '', value: '' }]
-                              : current.filter((_, itemIndex) => itemIndex !== index)
-                          ))}
-                          className="px-2 text-gray-400 hover:text-red-600">×</button>
-                      </div>
-                    ))}
-                  </div>
-                  <p className="mt-2 text-[11px] text-gray-400">
-                    Custom labels or tags are validated against each evidence source before collection.
+                  <p className="md:col-span-4 text-[11px] text-slate-500">
+                    {mode === 'watch'
+                      ? 'Each run checks the interval that just ended for HTTP 5xx server errors and runs a root-cause analysis only when some are found; otherwise it is marked "No server errors".'
+                      : 'Each run analyses the interval that just ended; a schedule ignores Start and End.'}
                   </p>
-                </div>
                 </div>
               )}
             </div>
+
+            {/* 2. The request: question, time and model. */}
+            <div className="rounded-lg border border-slate-200 bg-white p-3 space-y-3">
+              {mode !== 'watch' && (
+                <div>
+                  <label htmlFor="rca-query" className="block text-xs font-medium text-gray-700 mb-1">Analysis request</label>
+                  <textarea id="rca-query" value={query} onChange={(e) => setQuery(e.target.value)}
+                    maxLength={8000}
+                    className="border rounded px-3 py-2 text-sm w-full h-20"
+                    placeholder="Describe the incident or question to investigate" />
+                </div>
+              )}
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                {mode === 'once' && (
+                  <>
+                    <div>
+                      <label htmlFor="rca-time-start" className="block text-xs text-gray-600 mb-1">Start</label>
+                      <input id="rca-time-start" type="datetime-local" value={timeStart} onChange={(e) => setTimeStart(e.target.value)}
+                        className="border rounded px-3 py-1.5 text-sm w-full" />
+                    </div>
+                    <div>
+                      <label htmlFor="rca-time-end" className="block text-xs text-gray-600 mb-1">End</label>
+                      <input id="rca-time-end" type="datetime-local" value={timeEnd} onChange={(e) => setTimeEnd(e.target.value)}
+                        className="border rounded px-3 py-1.5 text-sm w-full" />
+                    </div>
+                  </>
+                )}
+                <div>
+                  <label htmlFor="rca-connection" className="block text-xs text-gray-600 mb-1">Connection</label>
+                  <select
+                    id="rca-connection"
+                    value={connectionId}
+                    disabled={enabledConnections.length === 0}
+                    onChange={(e) => {
+                      const nextId = e.target.value;
+                      const connection = enabledConnections.find((item) => String(item.id) === nextId);
+                      setConnectionId(nextId);
+                      setConnectionModels(connection?.default_model ? [connection.default_model] : []);
+                      setModelName(connection?.default_model || '');
+                    }}
+                    className="border rounded px-2 py-1.5 text-sm w-full disabled:bg-gray-100"
+                  >
+                    {enabledConnections.length === 0 && <option value="">No enabled connection</option>}
+                    {enabledConnections.map((connection) => (
+                      <option key={connection.id} value={connection.id}>
+                        {connection.name} ({connection.provider})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="rca-model" className="block text-xs text-gray-600 mb-1">Model</label>
+                  <select id="rca-model" value={modelName} disabled={connectionModels.length === 0}
+                    onChange={(e) => setModelName(e.target.value)}
+                    className="border rounded px-2 py-1.5 text-sm w-full disabled:bg-gray-100">
+                    {connectionModels.length === 0 && <option value="">No model</option>}
+                    {connectionModels.map((mn) => <option key={mn} value={mn}>{mn}</option>)}
+                  </select>
+                </div>
+              </div>
+              {mode === 'once' && (
+                <p className="text-xs text-gray-500">
+                  Start and End are optional; leave them empty to analyse the last 30 minutes. Provide both if you set either.
+                </p>
+              )}
+            </div>
+
+            {/* 3. Where to look: the route context plus per-source scope. */}
+            <div className="rounded-lg border border-slate-200 bg-white">
+              <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 px-3 py-2">
+                <span className="text-sm font-medium text-slate-800">Investigation scope</span>
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-500">Optional</span>
+                <span className="ml-auto flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-slate-500">Context</span>
+                  {nsId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">NS {nsId}</span>}
+                  {infraId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">Infra {infraId}</span>}
+                  {nodeId && <span className="text-xs rounded-full bg-slate-100 text-slate-600 px-2 py-0.5">Node {nodeId}</span>}
+                  {!nsId && !infraId && !nodeId && <span className="text-xs text-gray-400">all namespaces</span>}
+                </span>
+              </div>
+              <div className="space-y-3 p-3">
+                <div className="grid grid-cols-1 md:grid-cols-[9rem_1fr] gap-3 items-start">
+                  <div className="pt-1">
+                    <span className="block text-xs font-medium text-slate-700">Log · Trace</span>
+                    <span className="block text-[11px] text-slate-500">applies to both sources</span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div>
+                      <label htmlFor="rca-service-name" className="block text-xs text-gray-600 mb-1">Service</label>
+                      <input id="rca-service-name" value={serviceName} onChange={(e) => setServiceName(e.target.value)}
+                        className="border rounded px-3 py-1.5 text-sm w-full" placeholder="checkout-api" />
+                    </div>
+                  </div>
+                </div>
+                {mode !== 'watch' && (
+                  <div className="grid grid-cols-1 md:grid-cols-[9rem_1fr] gap-3 items-start">
+                    <div className="pt-1">
+                      <span className="block text-xs font-medium text-slate-700">Trace</span>
+                      <span className="block text-[11px] text-slate-500">span route, status, one trace</span>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      <div>
+                        <label htmlFor="rca-endpoint" className="block text-xs text-gray-600 mb-1">Endpoint (route)</label>
+                        <input id="rca-endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)}
+                          className="border rounded px-3 py-1.5 text-sm w-full" placeholder="POST /checkout" />
+                      </div>
+                      <div>
+                        <label htmlFor="rca-status-code" className="block text-xs text-gray-600 mb-1">HTTP status code</label>
+                        <input id="rca-status-code" value={statusCode} onChange={(e) => setStatusCode(e.target.value)}
+                          className="border rounded px-3 py-1.5 text-sm w-full" placeholder="500 or 5xx" />
+                      </div>
+                      {mode === 'once' && (
+                        <div>
+                          <label htmlFor="rca-trace-id" className="block text-xs text-gray-600 mb-1">Trace ID</label>
+                          <input id="rca-trace-id" value={traceId} onChange={(e) => setTraceId(e.target.value)}
+                            className="border rounded px-3 py-1.5 text-sm w-full" />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+                <div className="grid grid-cols-1 md:grid-cols-[9rem_1fr] gap-3 items-start">
+                  <div className="pt-1">
+                    <span className="block text-xs font-medium text-slate-700">Metric</span>
+                    <span className="block text-[11px] text-slate-500">Telegraf measurement</span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div>
+                      <label htmlFor="rca-measurement" className="block text-xs text-gray-600 mb-1">Measurement</label>
+                      <input id="rca-measurement" value={measurement} onChange={(e) => setMeasurement(e.target.value)}
+                        className="border rounded px-3 py-1.5 text-sm w-full" placeholder="cpu" />
+                    </div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-[9rem_1fr] gap-3 items-start">
+                  <div className="pt-1">
+                    <span className="block text-xs font-medium text-slate-700">Filters</span>
+                    <span className="block text-[11px] text-slate-500">custom labels or tags, every source</span>
+                  </div>
+                  <div>
+                    <div className="space-y-2">
+                      {additionalFilters.map((filter, index) => (
+                        <div key={index} className="flex gap-2">
+                          <input aria-label={`Additional filter ${index + 1} key`} value={filter.key}
+                            onChange={(e) => setAdditionalFilters((current) => current.map((item, itemIndex) => (
+                              itemIndex === index ? { ...item, key: e.target.value } : item
+                            )))}
+                            className="border rounded px-3 py-1.5 text-sm flex-1 min-w-0" placeholder="Key, e.g. region" />
+                          <input aria-label={`Additional filter ${index + 1} value`} value={filter.value}
+                            onChange={(e) => setAdditionalFilters((current) => current.map((item, itemIndex) => (
+                              itemIndex === index ? { ...item, value: e.target.value } : item
+                            )))}
+                            className="border rounded px-3 py-1.5 text-sm flex-1 min-w-0" placeholder="Value" />
+                          <button type="button" aria-label={`Remove additional filter ${index + 1}`}
+                            onClick={() => setAdditionalFilters((current) => (
+                              current.length === 1
+                                ? [{ key: '', value: '' }]
+                                : current.filter((_, itemIndex) => itemIndex !== index)
+                            ))}
+                            className="px-2 text-gray-400 hover:text-red-600">×</button>
+                        </div>
+                      ))}
+                    </div>
+                    <button type="button"
+                      onClick={() => setAdditionalFilters((current) => [...current, { key: '', value: '' }])}
+                      className="mt-2 text-xs text-blue-600 hover:text-blue-800">+ Add filter</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* 4. One action, named after what it creates. */}
             <div className="flex flex-col gap-3 border-t border-slate-200 pt-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 {enabledConnections.length === 0 ? (
                   <p className="text-xs font-medium text-amber-700">Add an enabled LLM connection before starting an analysis.</p>
-                ) : (
+                ) : mode === 'once' ? (
                   <p className="text-xs text-slate-500">The analysis runs on the server for a few minutes; the result appears in the list below (you may leave this page).</p>
+                ) : (
+                  <p className="text-xs text-slate-500">Saved schedules and watches appear in “Automatic RCA” above; each run's result appears in the list below.</p>
                 )}
               </div>
-              <div className="flex flex-wrap items-end gap-2">
-                {/* Same request, two destinations: run it once, or repeat it on an interval. */}
-                <label className="text-[11px] text-gray-500">
-                  Schedule name
-                  <input value={scheduleName} onChange={(e) => setScheduleName(e.target.value)} maxLength={100}
-                    placeholder="checkout errors" className="block border rounded px-2 py-1 text-xs text-gray-700 w-40" />
-                </label>
-                <label className="text-[11px] text-gray-500">
-                  Every (min)
-                  <input type="number" min={5} max={10080} value={scheduleInterval}
-                    onChange={(e) => setScheduleInterval(e.target.value)}
-                    className="block border rounded px-2 py-1 text-xs text-gray-700 w-20" />
-                </label>
-                <button type="button" onClick={handleSaveSchedule} disabled={busy || !scheduleName.trim()}
-                  className="min-h-10 rounded-md border border-purple-600 px-4 py-2 text-sm font-semibold text-purple-700 hover:bg-purple-50 disabled:cursor-not-allowed disabled:opacity-50">
-                  Save as schedule
-                </button>
-                <p className="w-full text-[11px] text-slate-500">
-                  A schedule ignores the start and end above: each run analyses the interval that just ended.
-                </p>
-                <button type="submit" disabled={busy || !connectionId || !modelName} aria-busy={busy}
-                  className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-purple-600 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50">
-                  {busy && (
-                    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 animate-spin">
-                      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeOpacity="0.3" strokeWidth="3" />
-                      <path d="M21 12a9 9 0 0 0-9-9" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="3" />
-                    </svg>
-                  )}
-                  {busy ? 'Analyzing…' : 'Run RCA analysis'}
-                </button>
-              </div>
+              <button type="submit" aria-busy={busy}
+                disabled={busy || !connectionId || !modelName || (mode !== 'once' && !scheduleName.trim())}
+                className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-purple-600 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50">
+                {busy && (
+                  <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 animate-spin">
+                    <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeOpacity="0.3" strokeWidth="3" />
+                    <path d="M21 12a9 9 0 0 0-9-9" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="3" />
+                  </svg>
+                )}
+                {busy ? 'Working…' : mode === 'once' ? 'Run RCA analysis' : mode === 'schedule' ? 'Save schedule' : 'Save watch'}
+              </button>
             </div>
           </form>
         )}
